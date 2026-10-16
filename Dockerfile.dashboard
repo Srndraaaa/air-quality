@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --timeout 120 --retries 10 \
     streamlit==1.49.1 \
     psycopg2-binary==2.9.10 \
     pandas==2.2.3

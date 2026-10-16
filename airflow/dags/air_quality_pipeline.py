@@ -253,8 +253,9 @@ def air_quality_pipeline():
                     # Meminta waktu hasil API menggunakan zona Asia/Makassar (WITA).
                     "timezone": "Asia/Makassar",
 
-                    # Sertakan data satu hari ke belakang.
-                    "past_days": 1,
+                    # Sertakan riwayat 30 hari ke belakang supaya model ML (E4)
+                    # punya cukup data training, dan tetap aman di-upsert ulang.
+                    "past_days": 30,
 
                     # Sertakan forecast satu hari ke depan.
                     "forecast_days": 1,
