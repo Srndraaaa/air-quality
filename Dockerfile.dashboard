@@ -1,0 +1,12 @@
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir \
+    streamlit==1.49.1 \
+    psycopg2-binary==2.9.10 \
+    pandas==2.2.3
+
+WORKDIR /app
+COPY dashboard/app.py /app/app.py
+
+EXPOSE 8501
+CMD ["streamlit", "run", "/app/app.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.gatherUsageStats=false"]
