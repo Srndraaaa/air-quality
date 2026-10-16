@@ -1,8 +1,9 @@
 """Dashboard kelas: seluruh angka berasal dari fact dan dimension warehouse.
 
-Dua tab, satu per jalur:
+Tiga tab:
 - Live (streaming): data sensor simulasi, diperbarui otomatis tiap 5 detik.
 - Per jam (batch): data Open-Meteo yang dimuat DAG Airflow.
+- Prediksi (ML): hasil model ridge (E4) vs baseline persistence dan CAMS.
 """
 
 import os
@@ -177,14 +178,122 @@ def render_batch() -> None:
     st.caption("Ini data model kualitas udara dari Open-Meteo/CAMS, bukan pembacaan sensor lapangan. Nilai kosong tetap kosong; jangan ditafsirkan sebagai nol. Indeks AQI Eropa hanya ditampilkan jika tersedia.")
 
 
+# ---------------------------------------------------------------- jalur ML (E4)
+
+def render_ml() -> None:
+    if st.button("Muat ulang data", key="ml_reload"):
+        st.rerun()
+
+    try:
+        evaluated = query("""
+            SELECT run_id, n_evaluated, mae_model, mae_persistence, mae_cams
+            FROM warehouse.ml_metrics
+            WHERE n_evaluated > 0
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """)
+        holdout = query("""
+            SELECT DISTINCT ON (city)
+                city, model_version, train_rows, holdout_rows,
+                holdout_mae_model, holdout_mae_persistence, trained_at
+            FROM warehouse.ml_model
+            ORDER BY city, trained_at DESC
+        """)
+        preds = query("""
+            SELECT target_at, city, predicted_pm2_5, persistence_pm2_5, cams_pm2_5, actual_pm2_5
+            FROM warehouse.ml_prediction
+            WHERE target_at >= (NOW() AT TIME ZONE 'Asia/Makassar') - INTERVAL '48 hours'
+            ORDER BY target_at
+        """)
+        history = query("""
+            SELECT run_id, model_version, n_evaluated, mae_model, mae_persistence, mae_cams
+            FROM warehouse.ml_metrics
+            WHERE n_evaluated > 0
+            ORDER BY updated_at DESC
+            LIMIT 10
+        """)
+        recent = query("""
+            SELECT created_at, city, target_at, predicted_pm2_5, persistence_pm2_5, cams_pm2_5, actual_pm2_5
+            FROM warehouse.ml_prediction
+            ORDER BY created_at DESC, target_at
+            LIMIT 20
+        """)
+    except (psycopg2.Error, OSError) as exc:
+        st.warning("Tabel ML belum siap. Pastikan DAG air_quality_ml sudah pernah berjalan.")
+        st.code(str(exc))
+        return
+
+    if preds.empty and holdout.empty:
+        st.info("Belum ada hasil ML. Jalankan DAG air_quality_ml di Airflow (butuh riwayat batch), lalu klik Muat ulang data.")
+        return
+
+    def mae(value) -> str:
+        return "—" if pd.isna(value) else f"{value:.2f}"
+
+    if not evaluated.empty:
+        row = evaluated.iloc[0]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Prediksi sudah dinilai", f"{int(row['n_evaluated']):,}")
+        k2.metric("MAE model (µg/m³)", mae(row["mae_model"]))
+        k3.metric("MAE persistence", mae(row["mae_persistence"]))
+        k4.metric("MAE CAMS", mae(row["mae_cams"]))
+        st.caption(f"MAE walk-forward kumulatif run `{row['run_id']}`: model, baseline persistence, dan forecast CAMS dinilai pada himpunan jam target yang sama setelah targetnya lewat.")
+    else:
+        valid = holdout.dropna(subset=["holdout_mae_model"])
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Kota termodel", len(holdout))
+        k2.metric("MAE holdout model", mae(valid["holdout_mae_model"].mean()) if not valid.empty else "—")
+        k3.metric("MAE holdout persistence", mae(valid["holdout_mae_persistence"].mean()) if not valid.empty else "—")
+        trained = pd.to_datetime(holdout["trained_at"]).max() if not holdout.empty else None
+        k4.metric("Training terakhir (WITA)", trained.tz_convert("Asia/Makassar").strftime("%d/%m %H:%M") if trained is not None else "—")
+        st.caption("Belum ada prediksi matang untuk dinilai (butuh ±9 jam sejak run pertama). Angka di atas = MAE holdout 48 jam terakhir, rata-rata kota.")
+
+    st.subheader("Prediksi vs aktual vs persistence vs CAMS")
+    if preds.empty:
+        st.info("Belum ada prediksi tersimpan dalam 48 jam terakhir.")
+    else:
+        city = st.selectbox("Pilih kota", sorted(preds["city"].unique().tolist()), key="ml_city")
+        view = preds.loc[preds["city"] == city].copy()
+        view["target_at"] = pd.to_datetime(view["target_at"])
+        chart = view.pivot_table(
+            index="target_at",
+            values=["predicted_pm2_5", "persistence_pm2_5", "cams_pm2_5", "actual_pm2_5"],
+            aggfunc="mean",
+        ).rename(columns={
+            "predicted_pm2_5": "Prediksi model",
+            "persistence_pm2_5": "Persistence",
+            "cams_pm2_5": "CAMS",
+            "actual_pm2_5": "Aktual",
+        })
+        st.line_chart(chart, x_label="Waktu (WITA)", y_label="PM2.5 (µg/m³)")
+        st.caption("48 jam terakhir sampai 6 jam ke depan. Garis aktual berhenti di jam sekarang; tiga garis lain adalah ramalan yang dibuat enam jam sebelum jam target.")
+
+    st.subheader("20 prediksi terbaru")
+    if recent.empty:
+        st.info("Belum ada prediksi tersimpan.")
+    else:
+        recent["created_at"] = pd.to_datetime(recent["created_at"]).dt.tz_convert("Asia/Makassar")
+        st.dataframe(recent, width="stretch", hide_index=True)
+
+    st.subheader("Riwayat MAE per run evaluasi")
+    if history.empty:
+        st.info("Belum ada run yang selesai dievaluasi. Evaluasi walk-forward butuh ±9 jam sejak prediksi pertama.")
+    else:
+        history[["mae_model", "mae_persistence", "mae_cams"]] = history[["mae_model", "mae_persistence", "mae_cams"]].round(2)
+        st.dataframe(history, width="stretch", hide_index=True)
+
+
 st.set_page_config(page_title="Kualitas Udara | Praktikum", layout="wide")
-st.title("Kualitas Udara Lima Kota")
+st.title("Kualitas Udara Empat Kota")
 st.caption("Praktikum Big Data · waktu Asia/Makassar (WITA)")
 
-tab_live, tab_batch = st.tabs(["Live (streaming)", "Per jam (batch)"])
+tab_live, tab_batch, tab_ml = st.tabs(["Live (streaming)", "Per jam (batch)", "Prediksi (ML)"])
 with tab_live:
     st.caption("Jalur streaming: sensor simulasi → Spark Structured Streaming → warehouse. Diperbarui otomatis tiap 5 detik.")
     render_live()
 with tab_batch:
     st.caption("Jalur batch: Open-Meteo → Airflow → Spark → warehouse. Diperbarui tiap run DAG (tiap 3 jam).")
     render_batch()
+with tab_ml:
+    st.caption("Jalur ML (E4): model ridge per kota → prediksi PM2.5 enam jam ke depan, dibandingkan baseline persistence dan forecast CAMS. Diperbarui tiap run DAG air_quality_ml (tiap jam).")
+    render_ml()
