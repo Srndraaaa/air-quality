@@ -52,21 +52,18 @@ UPPER_LIMIT = {
 
 # Semua variasi nama kota (huruf kecil, tanpa spasi di ujung) ke nama baku.
 CITY_ALIASES = {
-    "semarang": "Semarang", "kota semarang": "Semarang", "smg": "Semarang",
-    "jakarta": "Jakarta", "dki jakarta": "Jakarta", "jkt": "Jakarta",
-    "bandung": "Bandung", "kota bandung": "Bandung", "bdg": "Bandung",
-    "surabaya": "Surabaya", "kota surabaya": "Surabaya", "sby": "Surabaya",
-    "yogyakarta": "Yogyakarta", "kota yogyakarta": "Yogyakarta",
-    "jogja": "Yogyakarta", "yogya": "Yogyakarta",
+    "palu": "Palu", "kota palu": "Palu", "plw": "Palu",
+    "mamuju": "Mamuju", "kota mamuju": "Mamuju", "mju": "Mamuju",
+    "gorontalo": "Gorontalo", "kota gorontalo": "Gorontalo", "gto": "Gorontalo",
+    "manado": "Manado", "kota manado": "Manado", "mdc": "Manado",
 }
 
 # Koordinat baku, sama dengan CITIES di DAG jalur batch.
 COORDINATES = {
-    "Semarang": (-6.9667, 110.4167),
-    "Jakarta": (-6.2088, 106.8456),
-    "Bandung": (-6.9175, 107.6191),
-    "Surabaya": (-7.2575, 112.7521),
-    "Yogyakarta": (-7.7956, 110.3695),
+    "Palu": (-0.9083, 119.8708),
+    "Mamuju": (-2.6806, 118.8861),
+    "Gorontalo": (0.5375, 123.0625),
+    "Manado": (1.4822, 124.8489),
 }
 
 # Pesan kotor bisa berisi apa saja, jadi semua kolom dibaca sebagai teks dulu.
@@ -135,14 +132,14 @@ def process_batch(batch, batch_id: int) -> None:
     df = batch.withColumn("city_clean", alias_map[F.lower(F.trim(F.col("city")))])
 
     # 3. Waktu: harus terbaca, tidak di masa depan (> 5 menit), tidak terlambat (> 60 menit).
-    #    Jam pesan adalah jam WIB, jadi dibandingkan dengan "sekarang" versi WIB.
-    now_wib = F.from_utc_timestamp(F.current_timestamp(), "Asia/Jakarta")
+    #    Jam pesan adalah jam WITA, jadi dibandingkan dengan "sekarang" versi WITA.
+    now_wita = F.from_utc_timestamp(F.current_timestamp(), "Asia/Makassar")
     ts = F.try_to_timestamp(F.col("reading_at"), F.lit("yyyy-MM-dd HH:mm:ss"))
     df = df.withColumn("ts", ts).withColumn(
         "time_ok",
         F.col("ts").isNotNull()
-        & (F.col("ts") <= now_wib + F.expr("INTERVAL 5 MINUTES"))
-        & (F.col("ts") >= now_wib - F.expr("INTERVAL 60 MINUTES")),
+        & (F.col("ts") <= now_wita + F.expr("INTERVAL 5 MINUTES"))
+        & (F.col("ts") >= now_wita - F.expr("INTERVAL 60 MINUTES")),
     )
 
     # 4. Angka: koma jadi titik, teks yang bukan angka jadi NULL,

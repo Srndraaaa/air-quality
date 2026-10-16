@@ -78,11 +78,10 @@ API_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 # Setiap elemen berupa dictionary berisi nama kota, latitude, dan longitude.
 # Koordinat dipakai sebagai parameter ketika memanggil API.
 CITIES = [
-    {"city": "Semarang", "latitude": -6.9667, "longitude": 110.4167},
-    {"city": "Jakarta", "latitude": -6.2088, "longitude": 106.8456},
-    {"city": "Bandung", "latitude": -6.9175, "longitude": 107.6191},
-    {"city": "Surabaya", "latitude": -7.2575, "longitude": 112.7521},
-    {"city": "Yogyakarta", "latitude": -7.7956, "longitude": 110.3695},
+    {"city": "Palu", "latitude": -0.9083, "longitude": 119.8708},
+    {"city": "Mamuju", "latitude": -2.6806, "longitude": 118.8861},
+    {"city": "Gorontalo", "latitude": 0.5375, "longitude": 123.0625},
+    {"city": "Manado", "latitude": 1.4822, "longitude": 124.8489},
 ]
 
 
@@ -231,8 +230,8 @@ def air_quality_pipeline():
         rows = []
 
         # Loop setiap kota pada CITIES.
-        # Pada iterasi pertama location berisi Semarang,
-        # kemudian Jakarta, Bandung, Surabaya, dan Yogyakarta.
+        # Pada iterasi pertama location berisi Palu,
+        # kemudian Mamuju, Gorontalo, dan Manado.
         for location in CITIES:
 
             # requests.get(...) mengirim HTTP GET request ke Open-Meteo.
@@ -251,8 +250,8 @@ def air_quality_pipeline():
                     # Meminta variabel kualitas udara per jam.
                     "hourly": HOURLY_VARIABLES,
 
-                    # Meminta waktu hasil API menggunakan zona Asia/Jakarta.
-                    "timezone": "Asia/Jakarta",
+                    # Meminta waktu hasil API menggunakan zona Asia/Makassar (WITA).
+                    "timezone": "Asia/Makassar",
 
                     # Sertakan data satu hari ke belakang.
                     "past_days": 1,
@@ -827,7 +826,7 @@ air_quality_pipeline()
 # CARA MEMBACA PIPELINE SECARA SINGKAT
 # ------------------------------------
 #
-# "Setiap tiga jam Airflow memanggil Open-Meteo untuk lima kota.
+# "Setiap tiga jam Airflow memanggil Open-Meteo untuk empat kota.
 # Data per jam dikumpulkan dan di-upsert ke raw staging.
 # Setelah extract selesai, Airflow menjalankan Spark untuk membersihkan data.
 # Hasil clean staging kemudian dimuat ke tabel dimensi dan fact PostgreSQL.

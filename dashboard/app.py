@@ -74,18 +74,18 @@ def render_live() -> None:
             WHERE processed_at >= NOW() - INTERVAL '5 minutes'
         """).iloc[0]
         lag = query("""
-            SELECT EXTRACT(EPOCH FROM (NOW() AT TIME ZONE 'Asia/Jakarta') - MAX(reading_at)) AS seconds
+            SELECT EXTRACT(EPOCH FROM (NOW() AT TIME ZONE 'Asia/Makassar') - MAX(reading_at)) AS seconds
             FROM warehouse.fact_sensor_live
         """).iloc[0]["seconds"]
         live = query("""
             SELECT f.reading_at, l.city, f.pm2_5
             FROM warehouse.fact_sensor_live f
             JOIN warehouse.dim_location l USING (location_key)
-            WHERE f.reading_at >= (NOW() AT TIME ZONE 'Asia/Jakarta') - INTERVAL '10 minutes'
+            WHERE f.reading_at >= (NOW() AT TIME ZONE 'Asia/Makassar') - INTERVAL '10 minutes'
             ORDER BY f.reading_at
         """)
         raw = query("""
-            SELECT received_at AT TIME ZONE 'Asia/Jakarta' AS diterima, dirty_type AS jenis,
+            SELECT received_at AT TIME ZONE 'Asia/Makassar' AS diterima, dirty_type AS jenis,
                    city AS kota, reading_at AS jam, pm2_5, pm10, ozone
             FROM staging.sensor_raw
             ORDER BY raw_id DESC
@@ -110,7 +110,7 @@ def render_live() -> None:
         else:
             live["reading_at"] = pd.to_datetime(live["reading_at"])
             trend = live.pivot_table(index="reading_at", columns="city", values="pm2_5", aggfunc="mean")
-            st.line_chart(trend, x_label="Waktu (WIB)", y_label="PM2.5 (µg/m³)")
+            st.line_chart(trend, x_label="Waktu (WITA)", y_label="PM2.5 (µg/m³)")
     with right:
         st.subheader("Yang dibersihkan Spark (5 menit)")
         rules = pd.DataFrame(
@@ -159,14 +159,14 @@ def render_batch() -> None:
     k1.metric("Kota terpilih", len(selected))
     k2.metric("Baris fakta", f"{len(view):,}")
     k3.metric("PM2.5 rerata (µg/m³)", f"{view['pm2_5'].mean():.1f}" if view["pm2_5"].notna().any() else "—")
-    k4.metric("Jam data terakhir (WIB)", view["valid_at"].max().strftime("%d/%m/%Y %H:%M"))
+    k4.metric("Jam data terakhir (WITA)", view["valid_at"].max().strftime("%d/%m/%Y %H:%M"))
 
     st.subheader("PM2.5 per jam dalam tujuh hari terakhir")
     trend = recent.pivot_table(index="valid_at", columns="city", values="pm2_5", aggfunc="mean")
     if trend.empty:
         st.info("Tidak ada nilai PM2.5 pada rentang ini.")
     else:
-        st.line_chart(trend, x_label="Waktu (WIB)", y_label="PM2.5 (µg/m³)")
+        st.line_chart(trend, x_label="Waktu (WITA)", y_label="PM2.5 (µg/m³)")
 
     st.subheader("Rerata polutan per kota dalam tujuh hari terakhir")
     means = recent.groupby("city", as_index=True)[["pm2_5", "pm10"]].mean()
@@ -179,7 +179,7 @@ def render_batch() -> None:
 
 st.set_page_config(page_title="Kualitas Udara | Praktikum", layout="wide")
 st.title("Kualitas Udara Lima Kota")
-st.caption("Praktikum Big Data · waktu Asia/Jakarta")
+st.caption("Praktikum Big Data · waktu Asia/Makassar (WITA)")
 
 tab_live, tab_batch = st.tabs(["Live (streaming)", "Per jam (batch)"])
 with tab_live:

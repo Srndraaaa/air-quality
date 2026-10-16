@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 import psycopg2
 
-WIB = ZoneInfo("Asia/Jakarta")
+WITA = ZoneInfo("Asia/Makassar")
 INCOMING_DIR = "/opt/stream/incoming"
 TMP_DIR = "/opt/stream/tmp"
 INTERVAL = float(os.getenv("SIM_INTERVAL_SECONDS", "3"))
@@ -35,20 +35,18 @@ POLLUTANTS = [
 
 # Nilai cadangan kalau tabel fakta jalur batch masih kosong.
 FALLBACK = {
-    "Semarang": [35, 38, 300, 8, 20, 120],
-    "Jakarta": [60, 62, 450, 25, 15, 110],
-    "Bandung": [55, 58, 400, 12, 10, 100],
-    "Surabaya": [20, 23, 280, 10, 18, 115],
-    "Yogyakarta": [30, 32, 290, 7, 9, 125],
+    "Palu": [30, 33, 290, 9, 12, 110],
+    "Mamuju": [25, 28, 270, 8, 10, 105],
+    "Gorontalo": [28, 31, 300, 10, 11, 108],
+    "Manado": [22, 25, 260, 9, 8, 100],
 }
 
 # Variasi penulisan nama kota yang biasa muncul dari perangkat berbeda.
 CITY_VARIANTS = {
-    "Semarang": [" semarang ", "KOTA SEMARANG", "Smg"],
-    "Jakarta": ["jakarta", "DKI Jakarta", "Jkt"],
-    "Bandung": ["BANDUNG", "Kota Bandung", "Bdg"],
-    "Surabaya": ["surabaya ", "Kota Surabaya", "Sby"],
-    "Yogyakarta": ["Jogja", "yogya", "Kota Yogyakarta"],
+    "Palu": ["palu ", "KOTA PALU", "Plw"],
+    "Mamuju": ["mamuju", "Kota Mamuju", "Mju"],
+    "Gorontalo": ["GORONTALO", "Kota Gorontalo", "Gto"],
+    "Manado": ["manado ", "Kota Manado", "Mdc"],
 }
 
 # Jenis data kotor dan bobot kemunculannya.
@@ -90,10 +88,10 @@ def load_baseline() -> dict:
         ORDER BY l.city, ABS(EXTRACT(EPOCH FROM (t.valid_at - %s)))
     """
     baseline = {city: list(values) for city, values in FALLBACK.items()}
-    now_wib = datetime.now(WIB).replace(tzinfo=None)
+    now_wita = datetime.now(WITA).replace(tzinfo=None)
     try:
         with dw_connection() as conn, conn.cursor() as cur:
-            cur.execute(query, (now_wib,))
+            cur.execute(query, (now_wita,))
             for city, *values in cur.fetchall():
                 if city in baseline:
                     baseline[city] = [
@@ -107,11 +105,11 @@ def load_baseline() -> dict:
     return baseline
 
 
-def clean_reading(city: str, base: list, now_wib: datetime) -> dict:
+def clean_reading(city: str, base: list, now_wita: datetime) -> dict:
     reading = {
         "reading_id": uuid.uuid4().hex[:12],
         "city": city,
-        "reading_at": now_wib.strftime("%Y-%m-%d %H:%M:%S"),
+        "reading_at": now_wita.strftime("%Y-%m-%d %H:%M:%S"),
         "dirty_type": "bersih",
     }
     for name, value in zip(POLLUTANTS, base):
@@ -155,7 +153,7 @@ def make_dirty(reading: dict) -> list[dict]:
 
 def write_file(messages: list[dict]) -> str:
     """Tulis ke folder sementara dulu, baru dipindah. Spark tidak boleh membaca file setengah jadi."""
-    name = f"sensor_{datetime.now(WIB):%Y%m%d_%H%M%S_%f}.json"
+    name = f"sensor_{datetime.now(WITA):%Y%m%d_%H%M%S_%f}.json"
     tmp_path = os.path.join(TMP_DIR, name)
     with open(tmp_path, "w", encoding="utf-8") as handle:
         for message in messages:
@@ -177,10 +175,10 @@ def main() -> None:
             baseline = load_baseline()
             last_refresh = time.monotonic()
 
-        now_wib = datetime.now(WIB).replace(tzinfo=None)
+        now_wita = datetime.now(WITA).replace(tzinfo=None)
         messages = []
         for city, base in baseline.items():
-            reading = clean_reading(city, base, now_wib)
+            reading = clean_reading(city, base, now_wita)
             if random.random() < DIRTY_RATE:
                 messages.extend(make_dirty(reading))
             else:
