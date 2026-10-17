@@ -11,5 +11,6 @@ RUN pip install --no-cache-dir --timeout 120 --retries 10 \
     "apache-airflow==${AIRFLOW_VERSION}" \
     apache-airflow-providers-apache-spark==6.3.2 \
     pyspark==4.2.0 \
+    scikit-learn>=1.7.2 \
     psycopg2-binary \
     requests

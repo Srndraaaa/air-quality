@@ -192,6 +192,10 @@ def safe_value(hourly: dict, name: str, index: int):
     # historis yang terlewat sejak start_date.
     catchup=False,
 
+    # Satu run aktif saja: run bertumpuk (mis. catch-up) bisa saling menimpa
+    # staging dan warehouse.
+    max_active_runs=1,
+
     # Tags hanya untuk memudahkan pencarian/pengelompokan di Airflow UI.
     tags=["big-data", "air-quality", "spark", "postgresql"],
 )

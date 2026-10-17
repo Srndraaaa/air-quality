@@ -21,8 +21,9 @@
 #   split acak menaruh jam-jam "masa depan" yang mirip ke dalam test set,
 #   sehingga angka evaluasi terlihat bagus tetapi tidak mengukur kemampuan
 #   memprediksi ke depan.
-# - Model memakai ridge regression pure Python (lihat ml_lib.py) karena image
-#   Airflow tidak memuat library ML; tidak perlu rebuild image.
+# - Model memakai scikit-learn (Pipeline StandardScaler + Ridge, lihat
+#   ml_lib.py) yang ditambahkan ke Dockerfile.airflow; model dilatih ulang
+#   tiap run dengan bobot recency supaya menyesuaikan diri dengan data baru.
 # - Parameter model disimpan di tabel warehouse.ml_model, bukan file container
 #   (hilang saat rebuild) dan bukan volume (tabel database sudah menjadi
 #   penyimpanan bersama yang bisa dibaca semua task dan di-query siapa pun).
@@ -43,12 +44,13 @@ from ml_lib import FEATURE_COLUMNS, fit_ridge, model_input, predict_ridge
 # KONFIGURASI
 # ---------------------------------------------------------------------------
 
-HORIZON_HOURS = 6        # target prediksi: enam jam setelah jam asal (origin).
-HOLDOUT_HOURS = 48       # 48 jam terakhir dipakai sebagai holdout bersih.
-EVAL_DELAY_HOURS = 3     # jeda agar batch memperbarui nilai terbaik CAMS.
-MIN_TRAIN_ROWS = 24      # minimal pasangan (origin, target) per kota.
-RIDGE_LAMBDA = 1.0       # penalti ridge pada fitur terstandardisasi.
-MODEL_TAG = "ridge-v1"   # versi model: ridge-v1-YYYYMMDDHHMM
+HORIZON_HOURS = 6             # target prediksi: enam jam setelah jam asal (origin).
+HOLDOUT_HOURS = 48            # 48 jam terakhir dipakai sebagai holdout bersih.
+EVAL_DELAY_HOURS = 3          # jeda agar batch memperbarui nilai terbaik CAMS.
+MIN_TRAIN_ROWS = 24           # minimal pasangan (origin, target) per kota.
+RIDGE_LAMBDA = 1.0            # penalti ridge (alpha) pada fitur terstandardisasi.
+RECENCY_HALF_LIFE_HOURS = 168 # bobot data turun separuh tiap 168 jam (7 hari).
+MODEL_TAG = "sklearn-ridge-v1"  # versi model: sklearn-ridge-v1-YYYYMMDDHHMM
 WITA = ZoneInfo("Asia/Makassar")
 
 # Syarat kelengkapan fitur numerik sebelum baris boleh masuk training/scoring.
@@ -228,6 +230,9 @@ def hour_floor_wita() -> datetime:
     schedule="10 * * * *",
     start_date=datetime(2026, 1, 1),
     catchup=False,
+    # Satu run aktif saja: run yang bertumpuk (mis. catch-up setelah scheduler
+    # lama mati) pernah membuat dua write bersamaan ke tabel ML dan deadlock.
+    max_active_runs=1,
     tags=["big-data", "air-quality", "ml", "spark"],
 )
 def air_quality_ml():
@@ -294,7 +299,16 @@ def air_quality_ml():
                     for row in rows
                 ]
                 y_train = [float(row["label_pm2_5"]) for row in rows]
-                model = fit_ridge(x_train, y_train, RIDGE_LAMBDA)
+
+                # Bobot recency: baris yang makin tua bobotnya turun separuh
+                # tiap RECENCY_HALF_LIFE_HOURS jam, supaya model gesit mengikuti
+                # rezim terbaru tanpa membuang riwayat lama.
+                weights = [
+                    0.5 ** ((now_floor - row["origin_at"]).total_seconds()
+                            / 3600.0 / RECENCY_HALF_LIFE_HOURS)
+                    for row in rows
+                ]
+                model = fit_ridge(x_train, y_train, RIDGE_LAMBDA, weights=weights)
 
                 # Holdout bersih untuk laporan: MAE model vs persistence.
                 cur.execute(
