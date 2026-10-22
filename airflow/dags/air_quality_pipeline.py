@@ -12,17 +12,20 @@
 #    Menentukan API yang dipakai, kota yang diambil, dan variabel kualitas udara.
 #
 # 3. Helper function
-#    - dw_connection() : membuka koneksi ke PostgreSQL.
-#    - safe_value()    : mengambil nilai array API dengan aman.
+#    - dw_connection()      : membuka koneksi ke PostgreSQL.
+#    - safe_value()         : mengambil nilai array API dengan aman.
+#    - fetch_hourly_rows()  : ambil deret jam dari Open-Meteo.
+#    - upsert_raw_rows()    : tulis ke raw staging (idempotent).
 #
 # 4. Definisi DAG dan task
-#    - extract_api_to_raw()     : Extract + raw staging.
-#    - spark_clean_transform    : Transform dengan Spark.
-#    - load_data_warehouse()    : Load ke dimension/fact.
-#    - quality_check()          : Validasi hasil pipeline.
+#    - backfill_historical()  : isi jam bolong dengan data historis.
+#    - extract_api_to_raw()   : Extract + raw staging.
+#    - spark_clean_transform  : Transform dengan Spark.
+#    - load_data_warehouse()  : Load ke dimension/fact.
+#    - quality_check()        : Validasi hasil pipeline.
 #
 # 5. Dependency DAG
-#    extracted >> spark_clean_transform >> warehouse_loaded >> dq
+#    backfilled >> extracted >> spark_clean_transform >> warehouse_loaded >> dq
 #
 #    Tanda >> dibaca "setelah task di sebelah kiri selesai,
 #    jalankan task di sebelah kanan".
@@ -64,6 +67,11 @@ from airflow.sdk import dag, task
 # SparkSubmitOperator dipakai Airflow untuk menjalankan file Python Spark.
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 
+# batch_lib berisi helper murni jalur batch: konvensi jam WITA dan pencarian
+# jam bolong. Modul itu sengaja tidak mengimpor Airflow supaya bisa diuji
+# tanpa stack (pola yang sama dengan ml_lib.py, design.md D-015).
+from batch_lib import count_missing_hours, hour_floor_wita, missing_windows
+
 
 # ---------------------------------------------------------------------------
 # 2. KONFIGURASI SUMBER DATA
@@ -99,6 +107,17 @@ HOURLY_VARIABLES = (
     "pm2_5,pm10,carbon_monoxide,nitrogen_dioxide,"
     "sulphur_dioxide,ozone,european_aqi"
 )
+
+
+# Batas ke belakang pipeline boleh menarik data historis, dalam hari.
+#
+# Angka 92 adalah nilai maksimum parameter past_days Open-Meteo, jadi
+# dengan nilai ini gap yang bisa ditutup tidak pernah lebih tua dari arsip
+# CAMS global (data tersedia sejak sekitar September 2022).
+#
+# Nilai ini bisa diubah lewat environment variable BACKFILL_MAX_DAYS
+# tanpa menyentuh kode.
+BACKFILL_MAX_DAYS = int(os.getenv("BACKFILL_MAX_DAYS", "92"))
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +186,148 @@ def safe_value(hourly: dict, name: str, index: int):
 
 
 # ---------------------------------------------------------------------------
+# 4B. HELPER: AMBIL DERET JAM DARI API
+# ---------------------------------------------------------------------------
+
+def fetch_hourly_rows(location: dict, time_params: dict) -> list[tuple]:
+    """Ambil deret jam dari Open-Meteo untuk satu kota, siap di-insert.
+
+    `time_params` menentukan rentang waktu yang diminta:
+    - {"past_days": 30, "forecast_days": 1} -> data terkini plus riwayat 30 hari.
+    - {"start_hour": "...", "end_hour": "..."} -> window historis yang persis,
+      dipakai task backfill_historical untuk hanya meminta jam yang bolong.
+
+    Baris dikembalikan apa adanya. Kalau API menyisipkan jam tanpa nilai
+    polutan, nilainya tetap NULL dan jam itu tetap dihitung sebagai jam yang
+    terisi. Kalau baris seperti itu dibuang, pipeline akan meminta jam yang
+    sama pada setiap run dan quality_check akan selalu gagal.
+    """
+    # requests.get(...) mengirim HTTP GET request ke Open-Meteo.
+    response = requests.get(
+        # Endpoint API.
+        API_URL,
+
+        # params akan diubah requests menjadi query string URL.
+        params={
+            # Latitude kota yang sedang diproses.
+            "latitude": location["latitude"],
+
+            # Longitude kota yang sedang diproses.
+            "longitude": location["longitude"],
+
+            # Variabel kualitas udara per jam.
+            "hourly": HOURLY_VARIABLES,
+
+            # Waktu hasil API memakai zona Asia/Makassar (WITA).
+            "timezone": "Asia/Makassar",
+
+            # Rentang waktu, ditentukan oleh pemanggil.
+            **time_params,
+        },
+
+        # Jika server tidak merespons dalam 30 detik, request dianggap gagal.
+        timeout=30,
+    )
+
+    # Status HTTP error (4xx/5xx) membuat task gagal sehingga retry berjalan.
+    response.raise_for_status()
+
+    # Ambil bagian "hourly" dari response.
+    hourly = response.json()["hourly"]
+
+    # Wadah sementara untuk semua baris kota ini.
+    rows = []
+
+    # Satu iterasi = satu jam. Indeks i dipakai agar semua polutan diambil
+    # pada jam yang sama dengan timestamp-nya.
+    for i, valid_at in enumerate(hourly["time"]):
+        rows.append(
+            (
+                # Nama kota.
+                location["city"],
+
+                # Latitude kota.
+                location["latitude"],
+
+                # Longitude kota.
+                location["longitude"],
+
+                # Waktu data kualitas udara berlaku.
+                valid_at,
+
+                # Ambil PM2.5 pada indeks jam yang sama.
+                safe_value(hourly, "pm2_5", i),
+
+                # Ambil PM10.
+                safe_value(hourly, "pm10", i),
+
+                # Ambil carbon monoxide / CO.
+                safe_value(hourly, "carbon_monoxide", i),
+
+                # Ambil nitrogen dioxide / NO2.
+                safe_value(hourly, "nitrogen_dioxide", i),
+
+                # Ambil sulphur dioxide / SO2.
+                safe_value(hourly, "sulphur_dioxide", i),
+
+                # Ambil ozone / O3.
+                safe_value(hourly, "ozone", i),
+
+                # Ambil European AQI.
+                safe_value(hourly, "european_aqi", i),
+            )
+        )
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# 4C. HELPER: UPSERT KE RAW STAGING
+# ---------------------------------------------------------------------------
+
+def upsert_raw_rows(rows: list[tuple]) -> int:
+    """Upsert baris ke staging.air_quality_raw. Aman dijalankan ulang.
+
+    Kombinasi city + valid_at adalah identitas data, jadi baris yang sama
+    boleh ditulis berkali-kali tanpa menggandakan isi (design.md D-003).
+    """
+    # Tidak ada baris -> tidak perlu buka koneksi.
+    if not rows:
+        return 0
+
+    upsert_sql = """
+        INSERT INTO staging.air_quality_raw (
+            city, latitude, longitude, valid_at,
+            pm2_5, pm10, carbon_monoxide, nitrogen_dioxide,
+            sulphur_dioxide, ozone, european_aqi
+        ) VALUES %s
+
+        ON CONFLICT (city, valid_at) DO UPDATE SET
+            latitude = EXCLUDED.latitude,
+            longitude = EXCLUDED.longitude,
+            pm2_5 = EXCLUDED.pm2_5,
+            pm10 = EXCLUDED.pm10,
+            carbon_monoxide = EXCLUDED.carbon_monoxide,
+            nitrogen_dioxide = EXCLUDED.nitrogen_dioxide,
+            sulphur_dioxide = EXCLUDED.sulphur_dioxide,
+            ozone = EXCLUDED.ozone,
+            european_aqi = EXCLUDED.european_aqi,
+            ingested_at = NOW();
+    """
+
+    # "with" dipakai agar koneksi otomatis ditutup setelah blok selesai.
+    with dw_connection() as conn:
+
+        # Membuat cursor SQL.
+        with conn.cursor() as cur:
+
+            # execute_values mengirim banyak record sekaligus.
+            execute_values(cur, upsert_sql, rows, page_size=500)
+
+    return len(rows)
+
+
+# ---------------------------------------------------------------------------
 # 5. DEFINISI DAG AIRFLOW
 # ---------------------------------------------------------------------------
 
@@ -208,7 +369,96 @@ def air_quality_pipeline():
     # Airflow akan mengelola kapan task dijalankan berdasarkan dependency.
 
     # -----------------------------------------------------------------------
-    # 5A. TASK 1 — EXTRACT API -> RAW STAGING
+    # 5A. TASK 1 — BACKFILL HISTORIS (MENUTUPI JAM BOLONG)
+    # -----------------------------------------------------------------------
+
+    # Task ini berjalan lebih dulu, sebelum extract.
+    #
+    # Kalau di gudang ada jam-hour yang kosong — misalnya pipeline mati
+    # beberapa hari, atau ada kota yang datanya baru mulai masuk — jam-jam itu
+    # diambil dari arsip Open-Meteo memakai parameter start_hour/end_hour.
+    # Berbeda dengan extract yang selalu meminta 30 hari penuh, di sini API
+    # hanya mengembalikan jam-jam yang benar-benar bolong.
+    #
+    # retries=2 + execution_timeout:
+    # task ini menyentuh jaringan, jadi wajib punya keduanya (AGENTS.md).
+    @task(
+        retries=2,
+        retry_delay=timedelta(minutes=2),
+        execution_timeout=timedelta(minutes=15),
+    )
+    def backfill_historical() -> dict:
+        """Isi jam-hour yang kosong di raw staging dengan data historis."""
+
+        # Jam penuh sekarang menurut WITA, tanpa informasi zona waktu.
+        # Kolom valid_at adalah TIMESTAMP naive WITA, jadi perbandingan
+        # "sekarang" dengan kolom itu harus dilakukan di jam WITA juga
+        # (design.md D-001).
+        now_floor = hour_floor_wita()
+
+        # Batas paling tua yang boleh dicari. Jam yang lebih tua dari ini
+        # dianggap di luar jangkauan backfill.
+        oldest = now_floor - timedelta(days=BACKFILL_MAX_DAYS)
+
+        # Ringkasan per kota, dikembalikan sebagai XCom.
+        summary = {}
+
+        # Loop setiap kota pada CITIES.
+        for location in CITIES:
+
+            # Jam-jam yang sudah ada di raw staging untuk kota ini.
+            with dw_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT valid_at
+                        FROM staging.air_quality_raw
+                        WHERE city = %s AND valid_at BETWEEN %s AND %s
+                        ORDER BY valid_at
+                        """,
+                        (location["city"], oldest, now_floor),
+                    )
+                    existing = [row[0] for row in cur.fetchall()]
+
+            # Jam yang kosong, dikelompokkan jadi window berurutan supaya
+            # API hanya dipanggil sekali per lubuk.
+            windows = missing_windows(existing, oldest, now_floor)
+
+            # Kumpulkan baris dari semua window yang bolong.
+            rows = []
+            for gap_start, gap_end in windows:
+                rows.extend(
+                    fetch_hourly_rows(
+                        location,
+                        {
+                            # Open-Meteo menerima waktu ISO8601 dan
+                            # mengembalikan rentang itu inklusif di kedua
+                            # ujungnya.
+                            "start_hour": gap_start.strftime("%Y-%m-%dT%H:%M"),
+                            "end_hour": gap_end.strftime("%Y-%m-%dT%H:%M"),
+                        },
+                    )
+                )
+
+            # Tulis ke raw staging. Idempotent, jadi aman saat task di-retry.
+            upsert_raw_rows(rows)
+
+            gap_hours = count_missing_hours(existing, oldest, now_floor)
+            summary[location["city"]] = {
+                "windows": len(windows),
+                "gap_hours": gap_hours,
+                "rows": len(rows),
+            }
+
+            print(
+                f"[AIRFLOW] Backfill {location['city']}: "
+                f"{len(windows)} window, {gap_hours} jam bolong, {len(rows)} baris"
+            )
+
+        return summary
+
+    # -----------------------------------------------------------------------
+    # 5B. TASK 2 — EXTRACT API -> RAW STAGING
     # -----------------------------------------------------------------------
 
     # @task menjadikan fungsi berikut sebagai Airflow task.
@@ -238,163 +488,20 @@ def air_quality_pipeline():
         # kemudian Mamuju, Gorontalo, dan Manado.
         for location in CITIES:
 
-            # requests.get(...) mengirim HTTP GET request ke Open-Meteo.
-            response = requests.get(
-                # Endpoint API.
-                API_URL,
-
-                # params akan diubah requests menjadi query string URL.
-                params={
-                    # Latitude kota yang sedang diproses.
-                    "latitude": location["latitude"],
-
-                    # Longitude kota yang sedang diproses.
-                    "longitude": location["longitude"],
-
-                    # Meminta variabel kualitas udara per jam.
-                    "hourly": HOURLY_VARIABLES,
-
-                    # Meminta waktu hasil API menggunakan zona Asia/Makassar (WITA).
-                    "timezone": "Asia/Makassar",
-
-                    # Sertakan riwayat 30 hari ke belakang supaya model ML (E4)
-                    # punya cukup data training, dan tetap aman di-upsert ulang.
-                    "past_days": 30,
-
-                    # Sertakan forecast satu hari ke depan.
-                    "forecast_days": 1,
-                },
-
-                # Jika server tidak merespons dalam 30 detik,
-                # requests akan menghentikan request dan menganggapnya gagal.
-                timeout=30,
+            # Ambil deret jam dari Open-Meteo untuk kota ini.
+            #
+            # Sertakan riwayat 30 hari ke belakang supaya model ML (E4)
+            # punya cukup data training, dan tetap aman di-upsert ulang.
+            # Sertakan forecast satu hari ke depan.
+            rows.extend(
+                fetch_hourly_rows(
+                    location,
+                    {"past_days": 30, "forecast_days": 1},
+                )
             )
 
-            # Jika status HTTP adalah error, misalnya 4xx atau 5xx,
-            # baris ini akan melempar exception.
-            # Exception tersebut membuat task Airflow gagal dan mekanisme
-            # retry dapat bekerja.
-            response.raise_for_status()
-
-            # response.json() mengubah body JSON menjadi object Python
-            # (biasanya dictionary).
-            payload = response.json()
-
-            # Dari seluruh response API, kita hanya mengambil bagian "hourly".
-            hourly = payload["hourly"]
-
-            # hourly["time"] berisi daftar timestamp per jam.
-            #
-            # enumerate(...) memberi dua nilai sekaligus:
-            # - i        = nomor indeks: 0, 1, 2, ...
-            # - valid_at = timestamp pada indeks tersebut.
-            #
-            # Indeks i dipakai agar PM2.5, PM10, CO, NO2, SO2, O3, dan AQI
-            # diambil pada jam yang sama.
-            for i, valid_at in enumerate(hourly["time"]):
-
-                # Tambahkan satu record ke list rows.
-                rows.append(
-                    (
-                        # Nama kota.
-                        location["city"],
-
-                        # Latitude kota.
-                        location["latitude"],
-
-                        # Longitude kota.
-                        location["longitude"],
-
-                        # Waktu data kualitas udara berlaku.
-                        valid_at,
-
-                        # Ambil PM2.5 pada indeks jam yang sama.
-                        safe_value(hourly, "pm2_5", i),
-
-                        # Ambil PM10.
-                        safe_value(hourly, "pm10", i),
-
-                        # Ambil carbon monoxide / CO.
-                        safe_value(hourly, "carbon_monoxide", i),
-
-                        # Ambil nitrogen dioxide / NO2.
-                        safe_value(hourly, "nitrogen_dioxide", i),
-
-                        # Ambil sulphur dioxide / SO2.
-                        safe_value(hourly, "sulphur_dioxide", i),
-
-                        # Ambil ozone / O3.
-                        safe_value(hourly, "ozone", i),
-
-                        # Ambil European AQI.
-                        safe_value(hourly, "european_aqi", i),
-                    )
-                )
-
-        # -------------------------------------------------------------------
-        # SQL UPSERT KE RAW STAGING
-        # -------------------------------------------------------------------
-
-        # Triple quote """...""" memungkinkan SQL ditulis multi-baris.
-        #
-        # Istilah UPSERT = INSERT + UPDATE.
-        # Jika data baru -> INSERT.
-        # Jika city + valid_at sudah ada -> UPDATE.
-        upsert_sql = """
-            INSERT INTO staging.air_quality_raw (
-                city, latitude, longitude, valid_at,
-                pm2_5, pm10, carbon_monoxide, nitrogen_dioxide,
-                sulphur_dioxide, ozone, european_aqi
-            ) VALUES %s
-
-            ON CONFLICT (city, valid_at) DO UPDATE SET
-                latitude = EXCLUDED.latitude,
-                longitude = EXCLUDED.longitude,
-                pm2_5 = EXCLUDED.pm2_5,
-                pm10 = EXCLUDED.pm10,
-                carbon_monoxide = EXCLUDED.carbon_monoxide,
-                nitrogen_dioxide = EXCLUDED.nitrogen_dioxide,
-                sulphur_dioxide = EXCLUDED.sulphur_dioxide,
-                ozone = EXCLUDED.ozone,
-                european_aqi = EXCLUDED.european_aqi,
-                ingested_at = NOW();
-        """
-
-        # Cara membaca SQL di atas:
-        #
-        # INSERT INTO staging.air_quality_raw (...)
-        #   -> masukkan data ke tabel raw staging.
-        #
-        # VALUES %s
-        #   -> placeholder untuk sekumpulan rows yang nanti diisi
-        #      oleh execute_values().
-        #
-        # ON CONFLICT (city, valid_at)
-        #   -> anggap kombinasi city + valid_at sebagai identitas data.
-        #
-        # DO UPDATE SET ...
-        #   -> jika kombinasi itu sudah ada, perbarui nilainya.
-        #
-        # EXCLUDED.pm2_5 dan seterusnya
-        #   -> "nilai baru yang tadinya hendak di-INSERT".
-        #
-        # ingested_at = NOW()
-        #   -> catat waktu ketika record diperbarui.
-
-        # "with" dipakai agar koneksi otomatis ditutup setelah blok selesai.
-        with dw_connection() as conn:
-
-            # Membuat cursor SQL.
-            # Cursor adalah object untuk menjalankan perintah SQL.
-            with conn.cursor() as cur:
-
-                # execute_values mengirim banyak record sekaligus.
-                #
-                # cur        = cursor PostgreSQL.
-                # upsert_sql = SQL yang sudah dibuat.
-                # rows       = seluruh tuple hasil API.
-                # page_size=500 = kirim maksimal 500 record per batch.
-                execute_values(cur, upsert_sql, rows, page_size=500)
+        # Tulis sekaligus ke raw staging.
+        upsert_raw_rows(rows)
 
         # Log ini muncul pada log task Airflow.
         print(f"[AIRFLOW] Extracted/upserted {len(rows)} rows")
@@ -405,7 +512,7 @@ def air_quality_pipeline():
         return len(rows)
 
     # -----------------------------------------------------------------------
-    # 5B. TASK 2 — TRANSFORMASI DENGAN APACHE SPARK
+    # 5C. TASK 3 — TRANSFORMASI DENGAN APACHE SPARK
     # -----------------------------------------------------------------------
 
     # Berbeda dari task pertama yang berupa fungsi @task,
@@ -483,7 +590,7 @@ def air_quality_pipeline():
     # /opt/airflow/spark_jobs/transform_air_quality.py
 
     # -----------------------------------------------------------------------
-    # 5C. TASK 3 — LOAD CLEAN STAGING -> DATA WAREHOUSE
+    # 5D. TASK 4 — LOAD CLEAN STAGING -> DATA WAREHOUSE
     # -----------------------------------------------------------------------
 
     # @task tanpa parameter tambahan berarti task Python biasa
@@ -643,7 +750,7 @@ def air_quality_pipeline():
         return {"fact_rows": fact_rows}
 
     # -----------------------------------------------------------------------
-    # 5D. TASK 4 — DATA QUALITY CHECK
+    # 5E. TASK 5 — DATA QUALITY CHECK
     # -----------------------------------------------------------------------
 
     @task
@@ -658,6 +765,7 @@ def air_quality_pipeline():
         # 2. clean staging tidak boleh kosong.
         # 3. fact table tidak boleh kosong.
         # 4. PM2.5, PM10, dan European AQI tidak boleh negatif.
+        # 5. tidak boleh ada jam bolong di fact table (lihat task backfill).
         #
         # Jika rule gagal, raise ValueError membuat task gagal.
 
@@ -714,12 +822,64 @@ def air_quality_pipeline():
         if invalid_rows > 0:
             raise ValueError(f"DQ failed: {invalid_rows} invalid negative rows")
 
+        # -------------------------------------------------------------------
+        # RULE 5 — TIDAK BOLEH ADA JAM BOLONG DI FACT TABLE
+        # -------------------------------------------------------------------
+
+        # Task backfill_historical sudah mencoba menutup setiap jam yang
+        # kosong. Kalau masih ada jam bolong, berarti jendela itu tidak bisa
+        # diisi dari arsip Open-Meteo, jadi pipeline harus gagal supaya
+        # masalahnya terlihat, bukan diam-diam terbawa ke model ML.
+        #
+        # Yang dicek adalah fact table, bukan raw staging, karena yang
+        # dipakai downstream (ML dan dashboard) adalah fact table.
+        now_floor = hour_floor_wita()
+        oldest = now_floor - timedelta(days=BACKFILL_MAX_DAYS)
+
+        # Total jam bolong di semua kota.
+        gap_hours = 0
+
+        # Rincian per kota, dipakai di pesan error.
+        gap_detail = []
+
+        for location in CITIES:
+            with dw_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT t.valid_at
+                        FROM warehouse.fact_air_quality f
+                        JOIN warehouse.dim_location l
+                          ON l.location_key = f.location_key
+                        JOIN warehouse.dim_time t
+                          ON t.time_key = f.time_key
+                        WHERE l.city = %s AND t.valid_at BETWEEN %s AND %s
+                        ORDER BY t.valid_at
+                        """,
+                        (location["city"], oldest, now_floor),
+                    )
+                    existing = [row[0] for row in cur.fetchall()]
+
+            missing = count_missing_hours(existing, oldest, now_floor)
+
+            if missing > 0:
+                gap_hours += missing
+                gap_detail.append(f"{location['city']}={missing}")
+
+        # Jika masih ada jam bolong, hentikan task.
+        if gap_hours > 0:
+            raise ValueError(
+                f"DQ failed: {gap_hours} jam bolong di warehouse.fact_air_quality "
+                f"({', '.join(gap_detail)})"
+            )
+
         # Jika semua pemeriksaan lolos, susun ringkasan hasil quality check.
         result = {
             "raw_rows": raw_rows,
             "clean_rows": clean_rows,
             "fact_rows": fact_rows,
             "invalid_rows": invalid_rows,
+            "gap_hours": gap_hours,
             "status": "PASS",
         }
 
@@ -736,6 +896,11 @@ def air_quality_pipeline():
     # Memanggil fungsi task tidak berarti menjalankannya saat file dibaca.
     # Dalam konteks Airflow TaskFlow, pemanggilan ini membuat node/task
     # pada graph DAG.
+
+    # Membuat task backfill_historical.
+    backfilled = backfill_historical()
+
+    # Membuat task extract_api_to_raw.
     extracted = extract_api_to_raw()
 
     # Membuat task load_data_warehouse.
@@ -750,6 +915,8 @@ def air_quality_pipeline():
 
     # Operator >> dibaca "kemudian".
     #
+    # backfilled
+    #     >>
     # extracted
     #     >>
     # spark_clean_transform
@@ -760,14 +927,15 @@ def air_quality_pipeline():
     #
     # Artinya:
     #
-    # 1. extract_api_to_raw harus sukses lebih dahulu.
-    # 2. setelah itu Spark membersihkan/mentransformasi data.
-    # 3. setelah Spark sukses, data dimuat ke data warehouse.
-    # 4. terakhir, quality_check memvalidasi hasil.
+    # 1. backfill_historical menutup jam bolong lebih dulu.
+    # 2. extract_api_to_raw mengambil data terkini, harus sukses lebih dahulu.
+    # 3. setelah itu Spark membersihkan/mentransformasi data.
+    # 4. setelah Spark sukses, data dimuat ke data warehouse.
+    # 5. terakhir, quality_check memvalidasi hasil.
     #
     # Jika task di tengah gagal, task setelahnya tidak akan berjalan
     # dengan trigger rule default Airflow.
-    extracted >> spark_clean_transform >> warehouse_loaded >> dq
+    backfilled >> extracted >> spark_clean_transform >> warehouse_loaded >> dq
 
 
 # ---------------------------------------------------------------------------
@@ -785,13 +953,17 @@ air_quality_pipeline()
 #
 # Open-Meteo API
 #      |
-#      | HTTP GET oleh requests
+#      | HTTP GET (start_hour/end_hour per window bolong)
 #      v
-# extract_api_to_raw()
+# backfill_historical()
 #      |
 #      | UPSERT
 #      v
-# staging.air_quality_raw
+# staging.air_quality_raw <-----------.
+#      |                             |
+#      | HTTP GET (past_days=30)      | UPSERT
+#      v                             |
+# extract_api_to_raw() ---------------'
 #      |
 #      | dibaca dan ditransformasi oleh Spark
 #      v
@@ -819,6 +991,8 @@ air_quality_pipeline()
 # URUTAN TASK DI AIRFLOW
 # ----------------------
 #
+# backfill_historical
+#        >>
 # extract_api_to_raw
 #        >>
 # spark_clean_transform
@@ -831,9 +1005,10 @@ air_quality_pipeline()
 # CARA MEMBACA PIPELINE SECARA SINGKAT
 # ------------------------------------
 #
-# "Setiap tiga jam Airflow memanggil Open-Meteo untuk empat kota.
-# Data per jam dikumpulkan dan di-upsert ke raw staging.
+# "Setiap tiga jam Airflow menutup dulu jam-jam yang bolong di gudang dengan
+# menarik data historis Open-Meteo, lalu mengambil data terkini untuk empat
+# kota. Data per jam dikumpulkan dan di-upsert ke raw staging.
 # Setelah extract selesai, Airflow menjalankan Spark untuk membersihkan data.
 # Hasil clean staging kemudian dimuat ke tabel dimensi dan fact PostgreSQL.
-# Terakhir Airflow memeriksa bahwa tabel tidak kosong dan nilai utama
-# tidak mengandung angka negatif."
+# Terakhir Airflow memeriksa bahwa tabel tidak kosong, nilai utama tidak
+# mengandung angka negatif, dan tidak ada jam yang bolong di fact table."

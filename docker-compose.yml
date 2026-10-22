@@ -14,6 +14,9 @@ x-airflow-env: &airflow-env
   DW_DB: ${DW_DB:-air_quality_dw}
   DW_USER: ${POSTGRES_USER:-platform}
   DW_PASSWORD: ${POSTGRES_PASSWORD:-platform123}
+  # Batas ke belakang pipeline boleh menarik data historis (hari).
+  # 92 = maksimum parameter past_days Open-Meteo.
+  BACKFILL_MAX_DAYS: ${BACKFILL_MAX_DAYS:-92}
 
 x-airflow-volumes: &airflow-volumes
   - ./airflow/dags:/opt/airflow/dags
