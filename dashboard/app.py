@@ -1,9 +1,10 @@
 """Dashboard kelas: seluruh angka berasal dari fact dan dimension warehouse.
 
-Tiga tab:
+Empat tab:
 - Live (streaming): data sensor simulasi, diperbarui otomatis tiap 5 detik.
 - Per jam (batch): data Open-Meteo yang dimuat DAG Airflow.
 - Prediksi (ML): hasil model ridge (E4) vs baseline persistence dan CAMS.
+- Pengaturan: tombol on/off untuk tiap jalur pipeline.
 """
 
 import os
@@ -14,20 +15,38 @@ import psycopg2
 import streamlit as st
 
 
-def query(sql: str) -> pd.DataFrame:
-    with closing(psycopg2.connect(
+def connect():
+    """Koneksi ke PostgreSQL warehouse."""
+    return psycopg2.connect(
         host=os.getenv("DW_HOST", "postgres"),
         port=os.getenv("DW_PORT", "5432"),
         dbname=os.getenv("DW_DB", "air_quality_dw"),
         user=os.getenv("DW_USER", "platform"),
         password=os.getenv("DW_PASSWORD", "platform123"),
         connect_timeout=5,
-    )) as conn:
+    )
+
+
+def query(sql: str) -> pd.DataFrame:
+    with closing(connect()) as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
             rows = cur.fetchall()
             columns = [column[0] for column in cur.description]
     return pd.DataFrame(rows, columns=columns)
+
+
+def execute(sql: str, params: tuple = ()) -> int:
+    """Jalankan perintah tulis lalu commit.
+
+    Dipakai dashboard untuk menulis flag on/off. Semua perintah yang
+    dipakai di sini idempotent, jadi aman dijalankan ulang.
+    """
+    with closing(connect()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            conn.commit()
+            return cur.rowcount
 
 
 def read_fact() -> pd.DataFrame:
@@ -218,6 +237,20 @@ def render_ml() -> None:
             ORDER BY created_at DESC, target_at
             LIMIT 20
         """)
+        observations = query("""
+            SELECT t.valid_at, l.city, f.pm2_5, f.pm10, f.european_aqi
+            FROM warehouse.fact_air_quality f
+            JOIN warehouse.dim_location l USING (location_key)
+            JOIN warehouse.dim_time t USING (time_key)
+            ORDER BY t.valid_at DESC, l.city
+            LIMIT 20
+        """)
+        volume = query("""
+            SELECT COUNT(*) AS total_rows,
+                   COUNT(DISTINCT t.valid_at::DATE) AS total_days
+            FROM warehouse.fact_air_quality f
+            JOIN warehouse.dim_time t USING (time_key)
+        """).iloc[0]
     except (psycopg2.Error, OSError) as exc:
         st.warning("Tabel ML belum siap. Pastikan DAG air_quality_ml sudah pernah berjalan.")
         st.code(str(exc))
@@ -230,22 +263,30 @@ def render_ml() -> None:
     def mae(value) -> str:
         return "—" if pd.isna(value) else f"{value:.2f}"
 
+    # Berapa data yang sudah masuk database dan berapa lama rentangnya.
+    # Ini memberitahu apakah riwayat cukup untuk evaluasi walk-forward.
+    volume_label = (
+        f"{int(volume['total_rows']):,} baris ({int(volume['total_days'])} hari)"
+    )
+
     if not evaluated.empty:
         row = evaluated.iloc[0]
-        k1, k2, k3, k4 = st.columns(4)
+        k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Prediksi sudah dinilai", f"{int(row['n_evaluated']):,}")
         k2.metric("MAE model (µg/m³)", mae(row["mae_model"]))
         k3.metric("MAE persistence", mae(row["mae_persistence"]))
         k4.metric("MAE CAMS", mae(row["mae_cams"]))
+        k5.metric("Data di warehouse", volume_label)
         st.caption(f"MAE walk-forward kumulatif run `{row['run_id']}`: model, baseline persistence, dan forecast CAMS dinilai pada himpunan jam target yang sama setelah targetnya lewat.")
     else:
         valid = holdout.dropna(subset=["holdout_mae_model"])
-        k1, k2, k3, k4 = st.columns(4)
+        k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Kota termodel", len(holdout))
         k2.metric("MAE holdout model", mae(valid["holdout_mae_model"].mean()) if not valid.empty else "—")
         k3.metric("MAE holdout persistence", mae(valid["holdout_mae_persistence"].mean()) if not valid.empty else "—")
         trained = pd.to_datetime(holdout["trained_at"]).max() if not holdout.empty else None
         k4.metric("Training terakhir (WITA)", trained.tz_convert("Asia/Makassar").strftime("%d/%m %H:%M") if trained is not None else "—")
+        k5.metric("Data di warehouse", volume_label)
         st.caption("Belum ada prediksi matang untuk dinilai (butuh ±9 jam sejak run pertama). Angka di atas = MAE holdout 48 jam terakhir, rata-rata kota.")
 
     st.subheader("Prediksi vs aktual vs persistence vs CAMS")
@@ -282,12 +323,160 @@ def render_ml() -> None:
         history[["mae_model", "mae_persistence", "mae_cams"]] = history[["mae_model", "mae_persistence", "mae_cams"]].round(2)
         st.dataframe(history, width="stretch", hide_index=True)
 
+    st.subheader("20 observasi terbaru yang sudah masuk database")
+    if observations.empty:
+        st.info("Belum ada observasi di fact table. Jalankan DAG batch lebih dulu.")
+    else:
+        observations["valid_at"] = pd.to_datetime(observations["valid_at"])
+        st.dataframe(observations, width="stretch", hide_index=True)
+        st.caption("Baris faktual yang dipakai sebagai bahan latih dan sebagai pembanding 'aktual' di grafik di atas. Nilai kosong tetap kosong, jangan ditafsirkan sebagai nol.")
+
+
+# ---------------------------------------------------------------- pengaturan jalur
+
+# Tabel flag on/off. Dibuat dashboard karena dashboard satu-satunya penulisnya.
+# Init SQL Postgres hanya berjalan di volume baru, jadi tabel dibuat ulang
+# saat dashboard start (CREATE TABLE IF NOT EXISTS aman diulang).
+SETTINGS_DDL = """
+CREATE TABLE IF NOT EXISTS warehouse.pipeline_settings (
+    pipeline TEXT PRIMARY KEY,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
+
+SETTINGS_SEED = """
+INSERT INTO warehouse.pipeline_settings (pipeline, enabled)
+VALUES ('batch', TRUE), ('streaming', TRUE), ('ml', TRUE)
+ON CONFLICT (pipeline) DO NOTHING
+"""
+
+# Tiga jalur yang bisa dimatikan, plus keterangan efeknya.
+PIPELINES = {
+    "batch": {
+        "label": "Jalur batch",
+        "detail": "DAG air_quality_end_to_end, jadwal tiap 3 jam.",
+        "efek": "Dimatikan: run DAG berikutnya dilewati seluruhnya — tidak ada extract, tidak ada Spark, tidak ada data baru.",
+        "status_sql": """
+            SELECT MAX(t.valid_at) AS last_at
+            FROM warehouse.fact_air_quality f
+            JOIN warehouse.dim_time t USING (time_key)
+        """,
+        "status_label": "Data batch terakhir",
+    },
+    "streaming": {
+        "label": "Jalur streaming",
+        "detail": "sensor-simulator → Spark Structured Streaming → warehouse.",
+        "efek": "Dimatikan: simulator berhenti menulis file dan job Spark menghentikan query. Tidak ada data baru yang masuk dan folder incoming tidak menumpuk.",
+        "status_sql": "SELECT MAX(reading_at) AS last_at FROM warehouse.fact_sensor_live",
+        "status_label": "Data streaming terakhir",
+    },
+    "ml": {
+        "label": "Jalur ML (prediksi)",
+        "detail": "DAG air_quality_ml, jadwal tiap jam.",
+        "efek": "Dimatikan: run DAG berikutnya dilewati — features, training, scoring, dan evaluasi tidak dijalankan.",
+        "status_sql": "SELECT MAX(target_at) AS last_at FROM warehouse.ml_prediction",
+        "status_label": "Prediksi terakhir",
+    },
+}
+
+
+def read_settings() -> pd.DataFrame:
+    """Baca semua flag on/off yang tersimpan."""
+    return query("""
+        SELECT pipeline, enabled, updated_at
+        FROM warehouse.pipeline_settings
+        ORDER BY pipeline
+    """)
+
+
+def set_enabled(pipeline: str, enabled: bool) -> None:
+    """Simpan status on/off satu jalur."""
+    execute(
+        """
+        UPDATE warehouse.pipeline_settings
+        SET enabled = %s, updated_at = NOW()
+        WHERE pipeline = %s
+        """,
+        (enabled, pipeline),
+    )
+
+
+def last_status(meta: dict) -> str:
+    """Jam data terakhir dari sebuah jalur, atau '-' kalau tabelnya belum ada."""
+    try:
+        value = query(meta["status_sql"]).iloc[0]["last_at"]
+    except (psycopg2.Error, OSError, IndexError, KeyError):
+        return "—"
+    if pd.isna(value):
+        return "—"
+    return pd.to_datetime(value).strftime("%d/%m/%Y %H:%M")
+
+
+def render_settings() -> None:
+    st.caption("Perubahan berlaku pada run berikutnya. Tidak perlu restart container.")
+
+    # Tabel flag dibuat di sini supaya dashboard tidak bergantung pada
+    # DAG yang pernah jalan lebih dulu.
+    try:
+        try:
+            execute(SETTINGS_DDL)
+        except psycopg2.Error:
+            # Tabelnya sudah ada — CREATE TABLE IF NOT EXISTS bisa kalah
+            # race kalau dua sesi dashboard	start bersamaan.
+            pass
+        execute(SETTINGS_SEED)
+        settings = read_settings()
+    except (psycopg2.Error, OSError) as exc:
+        st.error("Tabel pengaturan belum bisa disiapkan. Pastikan PostgreSQL jalan.")
+        st.code(str(exc))
+        return
+
+    flags = {row["pipeline"]: row for _, row in settings.iterrows()}
+
+    for key, meta in PIPELINES.items():
+        row = flags.get(key)
+        enabled = bool(row["enabled"]) if row is not None else True
+        updated = row["updated_at"] if row is not None else None
+
+        with st.container(border=True):
+            left, right = st.columns([3, 2])
+            with left:
+                new_state = st.toggle(meta["label"], value=enabled, key=f"toggle_{key}")
+            with right:
+                st.caption(meta["detail"])
+
+            st.caption(meta["efek"])
+
+            # Widget Streamlit selalu kirim nilainya, jadi perbandingannya
+            # dengan nilai di database itu yang membedakan "tidak diubah"
+            # dari "baru saja diklik".
+            if new_state != enabled:
+                set_enabled(key, new_state)
+                settings = read_settings()
+                flags = {r["pipeline"]: r for _, r in settings.iterrows()}
+                if key in flags:
+                    updated = flags[key]["updated_at"]
+                st.success(
+                    f"{meta['label']} {'dinyalakan' if new_state else 'dimatikan'}."
+                )
+
+            status_line = f"{meta['status_label']}: {last_status(meta)}"
+            if updated is not None:
+                diubah = pd.to_datetime(updated)
+                if diubah.tzinfo is not None:
+                    diubah = diubah.tz_convert("Asia/Makassar")
+                status_line += f" · diubah {diubah.strftime('%d/%m/%Y %H:%M')}"
+            st.caption(status_line)
+
 
 st.set_page_config(page_title="Kualitas Udara | Praktikum", layout="wide")
 st.title("Kualitas Udara Empat Kota")
 st.caption("Praktikum Big Data · waktu Asia/Makassar (WITA)")
 
-tab_live, tab_batch, tab_ml = st.tabs(["Live (streaming)", "Per jam (batch)", "Prediksi (ML)"])
+tab_live, tab_batch, tab_ml, tab_settings = st.tabs(
+    ["Live (streaming)", "Per jam (batch)", "Prediksi (ML)", "Pengaturan"]
+)
 with tab_live:
     st.caption("Jalur streaming: sensor simulasi → Spark Structured Streaming → warehouse. Diperbarui otomatis tiap 5 detik.")
     render_live()
@@ -297,3 +486,6 @@ with tab_batch:
 with tab_ml:
     st.caption("Jalur ML (E4): model ridge per kota → prediksi PM2.5 enam jam ke depan, dibandingkan baseline persistence dan forecast CAMS. Diperbarui tiap run DAG air_quality_ml (tiap jam).")
     render_ml()
+with tab_settings:
+    st.caption("Kontrol on/off tiap jalur pipeline. Perubahan berlaku pada run berikutnya.")
+    render_settings()

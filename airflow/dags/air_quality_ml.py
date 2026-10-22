@@ -36,6 +36,7 @@ from zoneinfo import ZoneInfo
 
 import psycopg2
 from airflow.sdk import dag, task
+from airflow.sdk.exceptions import AirflowSkipException
 from psycopg2.extras import Json, RealDictCursor
 
 from ml_lib import FEATURE_COLUMNS, fit_ridge, model_input, predict_ridge
@@ -220,6 +221,28 @@ def hour_floor_wita() -> datetime:
     )
 
 
+def pipeline_enabled(pipeline: str) -> bool:
+    """True kalau jalur ini boleh jalan, False kalau dimatikan dari dashboard.
+
+    Flag disimpan di warehouse.pipeline_settings dan ditulis dashboard
+    (tab Pengaturan). Kalau tabelnya belum ada — dashboard belum pernah
+    jalan — jalur dianggap ON, supaya pipeline tidak macet karena tabel.
+    """
+    try:
+        with dw_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT enabled FROM warehouse.pipeline_settings WHERE pipeline = %s",
+                (pipeline,),
+            )
+            row = cur.fetchone()
+    except psycopg2.Error:
+        # Tabel belum ada -> biarkan jalur jalan.
+        return True
+
+    # Baris tidak ada -> pipeline itu belum pernah terdaftar -> default ON.
+    return True if row is None else bool(row[0])
+
+
 # ---------------------------------------------------------------------------
 # DAG
 # ---------------------------------------------------------------------------
@@ -243,6 +266,14 @@ def air_quality_ml():
     @task
     def build_features() -> dict:
         """Rakit ulang warehouse.ml_features dari fact dan dimensi."""
+        # Jalur ML bisa dimatikan dari dashboard (tab Pengaturan). Kalau
+        # dimatikan, task ini di-skip dan seluruh DAG ter-lewati, jadi
+        # ml_features tidak di-truncate dan tidak ada prediksi baru.
+        if not pipeline_enabled("ml"):
+            raise AirflowSkipException(
+                "Jalur ML dimatikan lewat warehouse.pipeline_settings"
+            )
+
         with dw_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(DDL)
             cur.execute("TRUNCATE warehouse.ml_features")

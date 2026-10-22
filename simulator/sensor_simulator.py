@@ -23,6 +23,8 @@ TMP_DIR = "/opt/stream/tmp"
 INTERVAL = float(os.getenv("SIM_INTERVAL_SECONDS", "3"))
 DIRTY_RATE = float(os.getenv("SIM_DIRTY_RATE", "0.25"))
 BASELINE_REFRESH_SECONDS = 60
+# Seberapa sering flag on/off dari dashboard dicek.
+FLAG_CHECK_SECONDS = 5
 
 POLLUTANTS = [
     "pm2_5",
@@ -74,6 +76,28 @@ def dw_connection():
         password=os.getenv("DW_PASSWORD", "platform123"),
         connect_timeout=5,
     )
+
+
+def pipeline_enabled(pipeline: str) -> bool:
+    """True kalau jalur ini boleh jalan, False kalau dimatikan dari dashboard.
+
+    Flag disimpan di warehouse.pipeline_settings dan ditulis dashboard
+    (tab Pengaturan). Kalau tabelnya belum ada — dashboard belum pernah
+    jalan — jalur dianggap ON, supaya simulator tidak berhenti tanpa alasan.
+    """
+    try:
+        with dw_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT enabled FROM warehouse.pipeline_settings WHERE pipeline = %s",
+                (pipeline,),
+            )
+            row = cur.fetchone()
+    except psycopg2.Error:
+        # Tabel belum ada -> biarkan jalur jalan.
+        return True
+
+    # Baris tidak ada -> pipeline itu belum pernah terdaftar -> default ON.
+    return True if row is None else bool(row[0])
 
 
 def load_baseline() -> dict:
@@ -170,10 +194,37 @@ def main() -> None:
     baseline = load_baseline()
     last_refresh = time.monotonic()
 
+    # Cek flag on/off tidak perlu tiap pesanan: cukup tiap FLAG_CHECK_SECONDS.
+    last_flag_check = 0.0
+    streaming_on = True
+    announced = None
+
     while True:
         if time.monotonic() - last_refresh > BASELINE_REFRESH_SECONDS:
             baseline = load_baseline()
             last_refresh = time.monotonic()
+
+        # Simulator berhenti menulis file kalau jalur streaming dimatikan.
+        # Ini penting dua hal: tidak ada file menumpuk di folder incoming
+        # (Spark memakai cleanSource=delete, jadi file yang menumpuk memenuhi
+        # disk), dan tidak ada pesan sia-sia yang nanti ditolak karena
+        # reading_at-nya sudah basi.
+        now = time.monotonic()
+        if now - last_flag_check > FLAG_CHECK_SECONDS:
+            streaming_on = pipeline_enabled("streaming")
+            last_flag_check = now
+            if streaming_on != announced:
+                announced = streaming_on
+                print(
+                    f"[SIMULATOR] Jalur streaming "
+                    f"{'dinyalakan' if streaming_on else 'dimatikan'} "
+                    "lewat pengaturan dashboard",
+                    flush=True,
+                )
+
+        if not streaming_on:
+            time.sleep(INTERVAL)
+            continue
 
         now_wita = datetime.now(WITA).replace(tzinfo=None)
         messages = []

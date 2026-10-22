@@ -7,6 +7,8 @@ process_batch: simpan mentah, bersihkan, muat ke fakta, catat kualitas.
 from __future__ import annotations
 
 import os
+import threading
+import time
 
 import psycopg2
 from pyspark.sql import SparkSession, functions as F
@@ -15,6 +17,9 @@ from pyspark.sql.types import StringType, StructField, StructType
 INCOMING_DIR = "/opt/stream/incoming"
 CHECKPOINT_DIR = "/opt/stream/checkpoint"
 DDL_FILE = "/opt/sql/03-streaming.sql"
+
+# Seberapa sering flag on/off dari dashboard dicek.
+FLAG_CHECK_SECONDS = 5
 
 
 def env(name: str, default: str) -> str:
@@ -113,6 +118,28 @@ def run_ddl() -> None:
     with psycopg2.connect(**DB) as conn, conn.cursor() as cur:
         cur.execute(sql)
     print("[STREAM] Tabel jalur streaming siap", flush=True)
+
+
+def pipeline_enabled(pipeline: str) -> bool:
+    """True kalau jalur ini boleh jalan, False kalau dimatikan dari dashboard.
+
+    Flag disimpan di warehouse.pipeline_settings dan ditulis dashboard
+    (tab Pengaturan). Kalau tabelnya belum ada — dashboard belum pernah
+    jalan — jalur dianggap ON, supaya streaming tidak berhenti sendiri.
+    """
+    try:
+        with psycopg2.connect(**DB) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT enabled FROM warehouse.pipeline_settings WHERE pipeline = %s",
+                (pipeline,),
+            )
+            row = cur.fetchone()
+    except psycopg2.Error:
+        # Tabel belum ada -> biarkan jalur jalan.
+        return True
+
+    # Baris tidak ada -> pipeline itu belum pernah terdaftar -> default ON.
+    return True if row is None else bool(row[0])
 
 
 def process_batch(batch, batch_id: int) -> None:
@@ -246,6 +273,17 @@ def process_batch(batch, batch_id: int) -> None:
 
 def main() -> None:
     run_ddl()
+
+    # Tunggu sampai jalur streaming dinyalakan lewat pengaturan dashboard.
+    # Proses ini tidak keluar saat flag mati: ia menunggu, lalu query
+    # dijalankan begitu flag dinyalakan.
+    announced = False
+    while not pipeline_enabled("streaming"):
+        if not announced:
+            print("[STREAM] Jalur streaming dimatikan lewat pengaturan; menunggu", flush=True)
+            announced = True
+        time.sleep(FLAG_CHECK_SECONDS)
+
     spark = SparkSession.builder.appName("AirQualitySensorStream").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
 
@@ -263,7 +301,28 @@ def main() -> None:
         .start()
     )
     print("[STREAM] Menunggu file baru di " + INCOMING_DIR, flush=True)
+
+    # Penghenti: kalau jalur dimatikan saat sedang berjalan, query dihentikan.
+    # Process lalu keluar, container merestart spark-submit, dan proses baru
+    # akan menunggu flag dinyalakan lagi. Checkpoint Spark dipakai lagi, jadi
+    # data yang sudah diproses tidak terulang.
+    stop_watch = threading.Event()
+
+    def watch_flag() -> None:
+        while not stop_watch.wait(FLAG_CHECK_SECONDS):
+            if not pipeline_enabled("streaming"):
+                print(
+                    "[STREAM] Jalur streaming dimatikan lewat pengaturan; "
+                    "menghentikan query",
+                    flush=True,
+                )
+                query.stop()
+                return
+
+    threading.Thread(target=watch_flag, daemon=True).start()
+
     query.awaitTermination()
+    stop_watch.set()
 
 
 if __name__ == "__main__":

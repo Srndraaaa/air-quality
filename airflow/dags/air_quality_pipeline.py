@@ -64,6 +64,11 @@ from psycopg2.extras import execute_values
 # @task mengubah fungsi Python menjadi task Airflow.
 from airflow.sdk import dag, task
 
+# AirflowSkipException menandai task sebagai skipped. Karena skip mengcascade
+# ke task-task berikutnya (trigger rule all_success), satu raise di task
+# pertama sudah cukup untuk melewati seluruh DAG.
+from airflow.sdk.exceptions import AirflowSkipException
+
 # SparkSubmitOperator dipakai Airflow untuk menjalankan file Python Spark.
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 
@@ -71,7 +76,6 @@ from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOpe
 # jam bolong. Modul itu sengaja tidak mengimpor Airflow supaya bisa diuji
 # tanpa stack (pola yang sama dengan ml_lib.py, design.md D-015).
 from batch_lib import count_missing_hours, hour_floor_wita, missing_windows
-
 
 # ---------------------------------------------------------------------------
 # 2. KONFIGURASI SUMBER DATA
@@ -154,6 +158,33 @@ def dw_connection():
         # bukan menggunakan default password di source code.
         password=os.getenv("DW_PASSWORD", "platform123"),
     )
+
+
+# ---------------------------------------------------------------------------
+# 3B. HELPER: CEK FLAG ON/OFF JALUR PIPELINE
+# ---------------------------------------------------------------------------
+
+def pipeline_enabled(pipeline: str) -> bool:
+    """True kalau jalur ini boleh jalan, False kalau dimatikan dari dashboard.
+
+    Flag disimpan di warehouse.pipeline_settings dan ditulis dashboard
+    (tab Pengaturan). Kalau tabelnya belum ada — dashboard belum pernah
+    jalan — jalur dianggap ON, supaya pipeline tidak macet karena tabel.
+    """
+    try:
+        with dw_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT enabled FROM warehouse.pipeline_settings WHERE pipeline = %s",
+                    (pipeline,),
+                )
+                row = cur.fetchone()
+    except psycopg2.Error:
+        # Tabel belum ada -> biarkan jalur jalan.
+        return True
+
+    # Baris tidak ada -> pipeline itu belum pernah terdaftar -> default ON.
+    return True if row is None else bool(row[0])
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +420,14 @@ def air_quality_pipeline():
     )
     def backfill_historical() -> dict:
         """Isi jam-hour yang kosong di raw staging dengan data historis."""
+
+        # Jalur batch bisa dimatikan dari dashboard (tab Pengaturan).
+        # Kalau dimatikan, task ini di-skip dan skip mengcascade ke semua
+        # task berikutnya, jadi tidak ada satu pun baris yang masuk gudang.
+        if not pipeline_enabled("batch"):
+            raise AirflowSkipException(
+                "Jalur batch dimatikan lewat warehouse.pipeline_settings"
+            )
 
         # Jam penuh sekarang menurut WITA, tanpa informasi zona waktu.
         # Kolom valid_at adalah TIMESTAMP naive WITA, jadi perbandingan
