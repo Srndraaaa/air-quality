@@ -1,17 +1,21 @@
 """Dashboard kelas: seluruh angka berasal dari fact dan dimension warehouse.
 
-Empat tab:
+Lima tab:
 - Live (streaming): data sensor simulasi, diperbarui otomatis tiap 5 detik.
 - Per jam (batch): data Open-Meteo yang dimuat DAG Airflow.
+- Analitik (batch): peta status per wilayah + ringkasan PM2.5 per kota.
 - Prediksi (ML): hasil model ridge (E4) vs baseline persistence dan CAMS.
 - Pengaturan: tombol on/off untuk tiap jalur pipeline.
 """
 
+import json
 import os
 from contextlib import closing
+from pathlib import Path
 
 import pandas as pd
 import psycopg2
+import pydeck as pdk
 import streamlit as st
 
 
@@ -57,6 +61,11 @@ def read_fact() -> pd.DataFrame:
         JOIN warehouse.dim_time AS t ON t.time_key = f.time_key
         ORDER BY t.valid_at DESC, l.city
     """)
+
+
+def read_cities() -> list[str]:
+    """Daftar kota dari dimension, supaya card tetap tampil meski fact kosong."""
+    return query("SELECT city FROM warehouse.dim_location ORDER BY city")["city"].tolist()
 
 
 # ---------------------------------------------------------------- jalur streaming
@@ -195,6 +204,238 @@ def render_batch() -> None:
     st.subheader("50 catatan terbaru")
     st.dataframe(view.head(50), width="stretch", hide_index=True)
     st.caption("Ini data model kualitas udara dari Open-Meteo/CAMS, bukan pembacaan sensor lapangan. Nilai kosong tetap kosong; jangan ditafsirkan sebagai nol. Indeks AQI Eropa hanya ditampilkan jika tersedia.")
+
+
+# ---------------------------------------------------------------- analitik per kota
+
+# Ambang konsentrasi PM2.5 (µg/m³) yang dipakai ISPU. Ini bukan nilai
+# indeks AQI, hanya klasifikasi konsentrasi supaya card mudah dibaca.
+PM25_BANDS = (
+    (15.5, "Baik"),
+    (55.4, "Sedang"),
+    (150.4, "Tidak sehat"),
+    (250.4, "Sangat tidak sehat"),
+)
+
+
+def pm25_status(value: float | None) -> str:
+    """Label status dari konsentrasi PM2.5, atau 'Data belum tersedia'."""
+    if value is None or pd.isna(value):
+        return "Data belum tersedia"
+    for upper, label in PM25_BANDS:
+        if value <= upper:
+            return label
+    return "Berbahaya"
+
+
+# Warna badge markdown dan isi polygon peta per status, supaya card dan
+# peta tidak pernah menampilkan kategori yang berbeda.
+STATUS_STYLE = {
+    "Baik": ("green", [46, 158, 91]),
+    "Sedang": ("blue", [59, 130, 196]),
+    "Tidak sehat": ("yellow", [227, 181, 5]),
+    "Sangat tidak sehat": ("orange", [224, 123, 26]),
+    "Berbahaya": ("red", [192, 57, 43]),
+    "Data belum tersedia": ("gray", [195, 199, 204]),
+}
+
+# Kota di dim_location adalah ibu kota provinsi. Pasangan ini memakai
+# shapeISO supaya tidak bergantung pada nama Inggris di GeoJSON.
+CITY_PROVINCE = {
+    "Palu": "ID-ST",
+    "Mamuju": "ID-SR",
+    "Gorontalo": "ID-GO",
+    "Manado": "ID-SA",
+}
+
+GEOJSON_PATH = Path(__file__).with_name("assets") / "sulawesi.geojson"
+
+
+def load_boundaries() -> dict | None:
+    """Batas provinsi dari aset lokal; None kalau aset tidak terbaca."""
+    try:
+        with GEOJSON_PATH.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def summarize_city(
+    city: str,
+    city_data: pd.DataFrame,
+    now_floor: pd.Timestamp,
+) -> dict:
+    """Angka satu kota; dipakai card dan peta supaya tidak dihitung dua kali."""
+    valid = city_data.dropna(subset=["pm2_5"]).sort_values("valid_at")
+    latest = valid.iloc[-1] if not valid.empty else None
+
+    last7d = city_data[city_data["valid_at"] > now_floor - pd.Timedelta(days=7)]
+    avg7 = last7d["pm2_5"].mean()
+
+    return {
+        "city": city,
+        "value": None if latest is None else float(latest["pm2_5"]),
+        "value_at": None if latest is None else latest["valid_at"],
+        "avg7": None if pd.isna(avg7) else float(avg7),
+        "n7": int(last7d["pm2_5"].notna().sum()),
+        "last_row_at": city_data["valid_at"].max() if not city_data.empty else None,
+        "status": pm25_status(None if latest is None else latest["pm2_5"]),
+    }
+
+
+def render_map(summaries: dict[str, dict], boundaries: dict) -> None:
+    """Choropleth: warna tiap provinsi mengikuti status kotanya."""
+    iso_status = {
+        CITY_PROVINCE[city]: item["status"]
+        for city, item in summaries.items()
+        if city in CITY_PROVINCE
+    }
+    features = boundaries.get("features", [])
+
+    # Satu layer per status supaya warna tetap konstan tanpa accessor string.
+    layers = []
+    for status, (_, color) in STATUS_STYLE.items():
+        subset = [
+            feature
+            for feature in features
+            if iso_status.get(
+                feature["properties"].get("shapeISO"), "Data belum tersedia"
+            )
+            == status
+        ]
+        if not subset:
+            continue
+        layers.append(
+            pdk.Layer(
+                "GeoJsonLayer",
+                data={"type": "FeatureCollection", "features": subset},
+                get_fill_color=color,
+                get_line_color=[255, 255, 255],
+                line_width_min_pixels=1,
+                pickable=True,
+                auto_highlight=True,
+            )
+        )
+
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=pdk.ViewState(latitude=-2.0, longitude=120.5, zoom=6),
+        # Basemap terang tanpa label: polygon tetap dominan, tile butuh internet.
+        map_style=pdk.map_styles.CARTO_LIGHT_NO_LABELS,
+    )
+    legend = "  ".join(
+        f":{color}-badge[{label}]" for label, (color, _) in STATUS_STYLE.items()
+    )
+
+    with st.container(border=True):
+        st.markdown("#### Peta status per wilayah")
+        st.pydeck_chart(deck, height=420)
+        st.markdown(legend)
+        st.caption(
+            "Warna = status PM2.5 kota; provinsi tanpa kota pada dataset "
+            "berwarna abu-abu. Batas wilayah: geoBoundaries (ODbL 1.0)."
+        )
+
+
+def render_city_card(summary: dict, now_floor: pd.Timestamp) -> None:
+    """Card ringkas: status menempel di nama kota, dua angka sejajar."""
+    with st.container(border=True):
+        color = STATUS_STYLE[summary["status"]][0]
+        st.markdown(
+            f"**{summary['city']}** &nbsp; "
+            f":{color}-badge[{summary['status']}]"
+        )
+
+        left, right = st.columns(2)
+        left.metric(
+            "PM2.5 terbaru",
+            "—" if summary["value"] is None else f"{summary['value']:.1f} µg/m³",
+        )
+        right.metric(
+            "Rerata 7 hari",
+            "—" if summary["avg7"] is None else f"{summary['avg7']:.1f} µg/m³",
+        )
+
+        notes = []
+        if summary["value_at"] is not None:
+            notes.append(f"Data {summary['value_at']:%d/%m %H:%M} WITA")
+        if summary["n7"]:
+            notes.append(f"{summary['n7']} jam berisi")
+        if (
+            summary["value_at"] is not None
+            and summary["last_row_at"] is not None
+            and summary["value_at"] < summary["last_row_at"]
+        ):
+            notes.append(
+                f"baris {summary['last_row_at']:%d/%m %H:%M} belum berisi PM2.5"
+            )
+        if (
+            summary["last_row_at"] is not None
+            and summary["last_row_at"] < now_floor - pd.Timedelta(hours=6)
+        ):
+            lag = int(
+                (now_floor - summary["last_row_at"]).total_seconds() // 3600
+            )
+            notes.append(f"⚠️ batch tertunda {lag} jam")
+        if notes:
+            st.caption(" · ".join(notes))
+
+
+def render_analytics() -> None:
+    """Ringkasan PM2.5 per kota dari jalur batch."""
+    if st.button("Muat ulang data", key="analytics_reload"):
+        st.rerun()
+
+    try:
+        cities = read_cities()
+        data = read_fact()
+    except (psycopg2.Error, OSError) as exc:
+        st.error(
+            "Database belum siap. Periksa status PostgreSQL dan "
+            "jalankan pipeline Airflow."
+        )
+        st.code(str(exc))
+        return
+
+    if not cities:
+        st.info(
+            "Belum ada lokasi di warehouse. Jalankan DAG "
+            "air_quality_end_to_end lebih dulu."
+        )
+        return
+    if data.empty:
+        st.info(
+            "Belum ada baris di fact table. Jalankan DAG "
+            "air_quality_end_to_end lalu klik Muat ulang data."
+        )
+        return
+
+    data["valid_at"] = pd.to_datetime(data["valid_at"])
+
+    # Jam sekarang WITA, naive seperti kolom valid_at. Baris forecast
+    # (valid_at di masa depan) tidak boleh dihitung sebagai observasi.
+    now_floor = pd.Timestamp.now(tz="Asia/Makassar").tz_localize(None).floor("h")
+    observed = data[data["valid_at"] <= now_floor]
+
+    summaries = {
+        city: summarize_city(city, observed[observed["city"] == city], now_floor)
+        for city in cities
+    }
+
+    boundaries = load_boundaries()
+    if boundaries is None:
+        st.warning(
+            "Aset batas wilayah tidak terbaca (dashboard/assets/sulawesi.geojson); "
+            "peta dilewati."
+        )
+    else:
+        render_map(summaries, boundaries)
+
+    for start in range(0, len(cities), 2):
+        cols = st.columns(2)
+        for col, city in zip(cols, cities[start:start + 2]):
+            with col:
+                render_city_card(summaries[city], now_floor)
 
 
 # ---------------------------------------------------------------- jalur ML (E4)
@@ -474,8 +715,14 @@ st.set_page_config(page_title="Kualitas Udara | Praktikum", layout="wide")
 st.title("Kualitas Udara Empat Kota")
 st.caption("Praktikum Big Data · waktu Asia/Makassar (WITA)")
 
-tab_live, tab_batch, tab_ml, tab_settings = st.tabs(
-    ["Live (streaming)", "Per jam (batch)", "Prediksi (ML)", "Pengaturan"]
+tab_live, tab_batch, tab_analytics, tab_ml, tab_settings = st.tabs(
+    [
+        "Live (streaming)",
+        "Per jam (batch)",
+        "Analitik",
+        "Prediksi (ML)",
+        "Pengaturan",
+    ]
 )
 with tab_live:
     st.caption("Jalur streaming: sensor simulasi → Spark Structured Streaming → warehouse. Diperbarui otomatis tiap 5 detik.")
@@ -483,6 +730,12 @@ with tab_live:
 with tab_batch:
     st.caption("Jalur batch: Open-Meteo → Airflow → Spark → warehouse. Diperbarui tiap run DAG (tiap 3 jam).")
     render_batch()
+with tab_analytics:
+    st.caption(
+        "Ringkasan batch per kota. Nilai dari model Open-Meteo/CAMS, bukan "
+        "sensor lapangan. Kategori memakai ambang PM2.5 ISPU, bukan AQI resmi."
+    )
+    render_analytics()
 with tab_ml:
     st.caption("Jalur ML (E4): model ridge per kota → prediksi PM2.5 enam jam ke depan, dibandingkan baseline persistence dan forecast CAMS. Diperbarui tiap run DAG air_quality_ml (tiap jam).")
     render_ml()
