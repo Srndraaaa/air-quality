@@ -17,6 +17,11 @@ x-airflow-env: &airflow-env
   # Batas ke belakang pipeline boleh menarik data historis (hari).
   # 92 = maksimum parameter past_days Open-Meteo.
   BACKFILL_MAX_DAYS: ${BACKFILL_MAX_DAYS:-92}
+  # Berapa kali jam yang pm2_5/pm10-nya NULL boleh diminta ulang, dan jedanya.
+  BACKFILL_MAX_ATTEMPTS: ${BACKFILL_MAX_ATTEMPTS:-3}
+  BACKFILL_RETRY_COOLDOWN_HOURS: ${BACKFILL_RETRY_COOLDOWN_HOURS:-24}
+  # Minimal jam berisi pm2_5+pm10 dalam 30 hari agar DQ lolos.
+  DQ_MIN_ML_HOURS: ${DQ_MIN_ML_HOURS:-24}
 
 x-airflow-volumes: &airflow-volumes
   - ./airflow/dags:/opt/airflow/dags

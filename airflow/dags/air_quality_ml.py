@@ -417,6 +417,15 @@ def air_quality_ml():
                 )
                 print(f"[ML] {city}: dilatih pada {len(rows)} baris ({report})")
 
+        # DAG tidak boleh hijau kalau tidak ada satu pun model yang dilatih:
+        # score_predictions akan memakai model lama/kosong tanpa peringatan.
+        if not trained:
+            raise ValueError(
+                "ML gagal: tidak ada kota yang punya cukup data training "
+                f"(minimal {MIN_TRAIN_ROWS} baris per kota; "
+                f"dilewati: {skipped or '-'})"
+            )
+
         print(f"[ML] Versi model {model_version}: dilatih {trained or '-'}, dilewati {skipped or '-'}")
         return {"model_version": model_version, "trained": trained, "skipped": skipped}
 

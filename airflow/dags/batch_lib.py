@@ -10,6 +10,8 @@
 # - missing_windows()         : mencari jam yang kosong lalu mengelompokkan
 #                               jam-jam berurutan menjadi satu window.
 # - count_missing_hours()     : berapa jam yang kosong di dalam rentang.
+# - select_gaps()             : memilih baris yang masih boleh dicoba ulang
+#                               berdasarkan nilai dan riwayat percobaan.
 #
 # Jalankan self-check dengan:
 #   python airflow/dags/batch_lib.py
@@ -88,6 +90,42 @@ def count_missing_hours(
     )
 
 
+def select_gaps(
+    rows: list[tuple[datetime, float | None, float | None, int, datetime | None]],
+    now: datetime,
+    max_attempts: int,
+    cooldown_hours: int,
+) -> set[datetime]:
+    """Pilih jam yang masih boleh diminta ulang ke Open-Meteo.
+
+    `rows` berisi (valid_at, pm2_5, pm10, backfill_attempts, last_backfill_at)
+    untuk jam yang barisnya sudah ada di raw staging. `now` dan
+    `last_backfill_at` sama-sama naive WITA (design.md D-001).
+
+    Satu jam tidak diminta ulang kalau:
+    - pm2_5 dan pm10 sudah sama-sama terisi,
+    - percobaannya sudah mencapai max_attempts, atau
+    - percobaan terakhir masih di dalam cooldown.
+    """
+    cooldown = timedelta(hours=cooldown_hours)
+    retry: set[datetime] = set()
+
+    for valid_at, pm2_5, pm10, attempts, last_attempt in rows:
+        if pm2_5 is not None and pm10 is not None:
+            continue
+        if attempts >= max_attempts:
+            continue
+        if (
+            attempts > 0
+            and last_attempt is not None
+            and now - last_attempt < cooldown
+        ):
+            continue
+        retry.add(valid_at)
+
+    return retry
+
+
 # ---------------------------------------------------------------------------
 # SELF-CHECK
 # ---------------------------------------------------------------------------
@@ -116,6 +154,40 @@ def _self_check() -> None:
 
     # Hitungan jam harus sama dengan isi window di atas.
     assert count_missing_hours(existing, lo, hi) == 3
+
+    # select_gaps: nilai lengkap tidak diminta ulang.
+    now = datetime(2026, 10, 3, 12, 0)
+    assert select_gaps([(lo, 10.0, 20.0, 0, None)], now, 3, 24) == set()
+
+    # PM2.5 atau PM10 yang NULL masih dianggap gap.
+    assert select_gaps(
+        [(lo, None, 20.0, 0, None), (lo + hour, 10.0, None, 0, None)],
+        now,
+        3,
+        24,
+    ) == {lo, lo + hour}
+
+    # Percobaan sudah maksimum -> jangan diminta lagi.
+    assert select_gaps([(lo, None, None, 3, None)], now, 3, 24) == set()
+
+    # Cooldown masih aktif -> tunggu; sudah lewat -> boleh dicoba.
+    assert select_gaps(
+        [(lo, None, None, 1, now - timedelta(hours=23))], now, 3, 24
+    ) == set()
+    assert select_gaps(
+        [(lo, None, None, 1, now - timedelta(hours=24))], now, 3, 24
+    ) == {lo}
+
+    # attempts=0 dengan last_backfill_at lama tidak boleh terkunci cooldown.
+    assert select_gaps([(lo, None, None, 0, now)], now, 3, 24) == {lo}
+
+    # Campuran: hanya baris yang masih boleh dicoba yang dikembalikan.
+    mixed = [
+        (lo, 10.0, 20.0, 0, None),
+        (lo + hour, None, 20.0, 0, None),
+        (lo + hour * 2, None, None, 3, None),
+    ]
+    assert select_gaps(mixed, now, 3, 24) == {lo + hour}
 
     # Jam yang terisi penuh: menit dan detik dibuang, tzinfo juga dibuang.
     assert hour_floor_wita(datetime(2026, 10, 1, 7, 45, 30, tzinfo=WITA)) == datetime(

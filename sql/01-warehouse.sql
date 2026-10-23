@@ -17,9 +17,31 @@ CREATE TABLE IF NOT EXISTS staging.air_quality_raw (
     sulphur_dioxide DOUBLE PRECISION,
     ozone DOUBLE PRECISION,
     european_aqi DOUBLE PRECISION,
+    -- Jumlah percobaan backfill untuk jam yang pm2_5/pm10-nya masih NULL.
+    backfill_attempts SMALLINT NOT NULL DEFAULT 0,
+    last_backfill_at TIMESTAMPTZ,
     source_name VARCHAR(50) NOT NULL DEFAULT 'Open-Meteo',
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (city, valid_at)
+);
+
+-- Log kualitas per run batch: metrik per kota, bukan hanya status pass/fail.
+CREATE TABLE IF NOT EXISTS staging.batch_quality_log (
+    run_id VARCHAR(200) NOT NULL,
+    city VARCHAR(100) NOT NULL,
+    window_start TIMESTAMP NOT NULL,
+    window_end TIMESTAMP NOT NULL,
+    hours_present INTEGER NOT NULL,
+    hours_usable INTEGER NOT NULL,
+    hours_all_null INTEGER NOT NULL,
+    hours_partial INTEGER NOT NULL,
+    hours_missing INTEGER NOT NULL,
+    known_unavailable INTEGER NOT NULL,
+    -- Selalu dihitung dari 30 hari terakhir, bukan dari window_start.
+    usable_30d INTEGER NOT NULL,
+    status VARCHAR(10) NOT NULL,
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (run_id, city)
 );
 
 -- Dimension: satu baris untuk satu kota/lokasi.

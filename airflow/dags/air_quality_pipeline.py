@@ -13,9 +13,11 @@
 #
 # 3. Helper function
 #    - dw_connection()      : membuka koneksi ke PostgreSQL.
+#    - ensure_batch_schema(): menambah kolom/tabel batch di volume lama.
 #    - safe_value()         : mengambil nilai array API dengan aman.
 #    - fetch_hourly_rows()  : ambil deret jam dari Open-Meteo.
 #    - upsert_raw_rows()    : tulis ke raw staging (idempotent).
+#    - record_backfill_attempts() : catat percobaan untuk jam yang masih NULL.
 #
 # 4. Definisi DAG dan task
 #    - backfill_historical()  : isi jam bolong dengan data historis.
@@ -75,7 +77,12 @@ from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOpe
 # batch_lib berisi helper murni jalur batch: konvensi jam WITA dan pencarian
 # jam bolong. Modul itu sengaja tidak mengimpor Airflow supaya bisa diuji
 # tanpa stack (pola yang sama dengan ml_lib.py, design.md D-015).
-from batch_lib import count_missing_hours, hour_floor_wita, missing_windows
+from batch_lib import (
+    count_missing_hours,
+    hour_floor_wita,
+    missing_windows,
+    select_gaps,
+)
 
 # ---------------------------------------------------------------------------
 # 2. KONFIGURASI SUMBER DATA
@@ -123,6 +130,47 @@ HOURLY_VARIABLES = (
 # tanpa menyentuh kode.
 BACKFILL_MAX_DAYS = int(os.getenv("BACKFILL_MAX_DAYS", "92"))
 
+# Berapa kali satu jam boleh diminta ulang ke Open-Meteo. API bisa
+# mengembalikan HTTP 200 dengan semua nilai NULL untuk periode arsip yang
+# tidak tersedia; tanpa batas, pipeline akan meminta jam yang sama terus.
+BACKFILL_MAX_ATTEMPTS = int(os.getenv("BACKFILL_MAX_ATTEMPTS", "3"))
+
+# Jeda minimal sebelum jam yang masih NULL dicoba lagi. Mencegah retry
+# beruntun setiap DAG run (jadwal 3 jam) untuk data yang belum tersedia.
+BACKFILL_RETRY_COOLDOWN_HOURS = int(
+    os.getenv("BACKFILL_RETRY_COOLDOWN_HOURS", "24")
+)
+
+# Minimal jam dengan pm2_5 dan pm10 terisi dalam 30 hari terakhir agar DQ
+# lolos. Tanpa ambang ini, pipeline bisa hijau meskipun isinya semua NULL.
+DQ_MIN_ML_HOURS = int(os.getenv("DQ_MIN_ML_HOURS", "24"))
+
+
+def validate_config() -> None:
+    """Gagal cepat kalau env var batch tidak masuk akal.
+
+    Dipanggil di task pertama, bukan saat file dibaca, supaya DAG tetap
+    terdaftar dan pesan errornya terlihat di log task.
+    """
+    if not 1 <= BACKFILL_MAX_DAYS <= 92:
+        raise ValueError(
+            f"BACKFILL_MAX_DAYS harus 1..92 (nilai sekarang {BACKFILL_MAX_DAYS})"
+        )
+    if not 1 <= BACKFILL_MAX_ATTEMPTS <= 10:
+        raise ValueError(
+            "BACKFILL_MAX_ATTEMPTS harus 1..10 "
+            f"(nilai sekarang {BACKFILL_MAX_ATTEMPTS})"
+        )
+    if BACKFILL_RETRY_COOLDOWN_HOURS < 1:
+        raise ValueError(
+            "BACKFILL_RETRY_COOLDOWN_HOURS harus >= 1 "
+            f"(nilai sekarang {BACKFILL_RETRY_COOLDOWN_HOURS})"
+        )
+    if DQ_MIN_ML_HOURS < 1:
+        raise ValueError(
+            f"DQ_MIN_ML_HOURS harus >= 1 (nilai sekarang {DQ_MIN_ML_HOURS})"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 3. HELPER: KONEKSI KE DATA WAREHOUSE POSTGRESQL
@@ -157,6 +205,43 @@ def dw_connection():
         # Untuk produksi sebaiknya password hanya berasal dari secret/env,
         # bukan menggunakan default password di source code.
         password=os.getenv("DW_PASSWORD", "platform123"),
+    )
+
+
+def ensure_batch_schema(cur) -> None:
+    """Tambahkan kolom/tabel batch yang belum ada di volume Postgres lama.
+
+    sql/01-warehouse.sql hanya dijalankan saat volume baru dibuat. DAG ini
+    yang menyusulkan perubahan skema ke volume yang sudah berjalan; semua
+    perintahnya idempotent sehingga aman dieksekusi setiap run.
+    """
+    cur.execute(
+        "ALTER TABLE staging.air_quality_raw "
+        "ADD COLUMN IF NOT EXISTS backfill_attempts SMALLINT NOT NULL DEFAULT 0"
+    )
+    cur.execute(
+        "ALTER TABLE staging.air_quality_raw "
+        "ADD COLUMN IF NOT EXISTS last_backfill_at TIMESTAMPTZ"
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS staging.batch_quality_log (
+            run_id VARCHAR(200) NOT NULL,
+            city VARCHAR(100) NOT NULL,
+            window_start TIMESTAMP NOT NULL,
+            window_end TIMESTAMP NOT NULL,
+            hours_present INTEGER NOT NULL,
+            hours_usable INTEGER NOT NULL,
+            hours_all_null INTEGER NOT NULL,
+            hours_partial INTEGER NOT NULL,
+            hours_missing INTEGER NOT NULL,
+            known_unavailable INTEGER NOT NULL,
+            usable_30d INTEGER NOT NULL,
+            status VARCHAR(10) NOT NULL,
+            checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (run_id, city)
+        )
+        """
     )
 
 
@@ -220,7 +305,11 @@ def safe_value(hourly: dict, name: str, index: int):
 # 4B. HELPER: AMBIL DERET JAM DARI API
 # ---------------------------------------------------------------------------
 
-def fetch_hourly_rows(location: dict, time_params: dict) -> list[tuple]:
+def fetch_hourly_rows(
+    location: dict,
+    time_params: dict,
+    expected_window: tuple[datetime, datetime] | None = None,
+) -> list[tuple]:
     """Ambil deret jam dari Open-Meteo untuk satu kota, siap di-insert.
 
     `time_params` menentukan rentang waktu yang diminta:
@@ -228,10 +317,13 @@ def fetch_hourly_rows(location: dict, time_params: dict) -> list[tuple]:
     - {"start_hour": "...", "end_hour": "..."} -> window historis yang persis,
       dipakai task backfill_historical untuk hanya meminta jam yang bolong.
 
-    Baris dikembalikan apa adanya. Kalau API menyisipkan jam tanpa nilai
-    polutan, nilainya tetap NULL dan jam itu tetap dihitung sebagai jam yang
-    terisi. Kalau baris seperti itu dibuang, pipeline akan meminta jam yang
-    sama pada setiap run dan quality_check akan selalu gagal.
+    Kalau `expected_window` diisi, jumlah dan ujung jam hasil API harus sama
+    persis dengan window yang diminta. Tanpa cek ini, respons yang terpotong
+    tetap dianggap sukses dan jam yang hilang tidak terlihat.
+
+    Baris dikembalikan apa adanya. Kalau API mengembalikan jam tanpa nilai
+    polutan, barisnya tetap disimpan dengan nilai NULL; backfill akan mencoba
+    ulang jam itu sampai batas percobaan (design.md D-018).
     """
     # requests.get(...) mengirim HTTP GET request ke Open-Meteo.
     response = requests.get(
@@ -266,12 +358,37 @@ def fetch_hourly_rows(location: dict, time_params: dict) -> list[tuple]:
     # Ambil bagian "hourly" dari response.
     hourly = response.json()["hourly"]
 
+    # Deret jam wajib ada. Kalau tidak ada, loop di bawah akan menghasilkan
+    # nol baris tanpa error dan jam bolong tidak pernah tertutup.
+    times = hourly.get("time") or []
+    if not times:
+        raise ValueError(
+            f"Open-Meteo tidak mengembalikan deret jam untuk {location['city']}"
+        )
+
+    # Validasi window historis: deret jam harus sama persis, bukan hanya
+    # jumlah dan ujungnya, supaya jam yang hilang di tengah tidak lolos.
+    if expected_window is not None:
+        start, end = expected_window
+        expected_hours = int((end - start) / timedelta(hours=1)) + 1
+        first = start.strftime("%Y-%m-%dT%H:%M")
+        last = end.strftime("%Y-%m-%dT%H:%M")
+        expected = [
+            (start + timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M")
+            for i in range(expected_hours)
+        ]
+        if times != expected:
+            raise ValueError(
+                f"Open-Meteo {location['city']}: {first}..{last} "
+                f"mengembalikan {len(times)} jam, seharusnya {expected_hours}"
+            )
+
     # Wadah sementara untuk semua baris kota ini.
     rows = []
 
     # Satu iterasi = satu jam. Indeks i dipakai agar semua polutan diambil
     # pada jam yang sama dengan timestamp-nya.
-    for i, valid_at in enumerate(hourly["time"]):
+    for i, valid_at in enumerate(times):
         rows.append(
             (
                 # Nama kota.
@@ -336,14 +453,28 @@ def upsert_raw_rows(rows: list[tuple]) -> int:
         ON CONFLICT (city, valid_at) DO UPDATE SET
             latitude = EXCLUDED.latitude,
             longitude = EXCLUDED.longitude,
-            pm2_5 = EXCLUDED.pm2_5,
-            pm10 = EXCLUDED.pm10,
-            carbon_monoxide = EXCLUDED.carbon_monoxide,
-            nitrogen_dioxide = EXCLUDED.nitrogen_dioxide,
-            sulphur_dioxide = EXCLUDED.sulphur_dioxide,
-            ozone = EXCLUDED.ozone,
-            european_aqi = EXCLUDED.european_aqi,
-            ingested_at = NOW();
+            pm2_5 = COALESCE(EXCLUDED.pm2_5, air_quality_raw.pm2_5),
+            pm10 = COALESCE(EXCLUDED.pm10, air_quality_raw.pm10),
+            carbon_monoxide = COALESCE(
+                EXCLUDED.carbon_monoxide, air_quality_raw.carbon_monoxide
+            ),
+            nitrogen_dioxide = COALESCE(
+                EXCLUDED.nitrogen_dioxide, air_quality_raw.nitrogen_dioxide
+            ),
+            sulphur_dioxide = COALESCE(
+                EXCLUDED.sulphur_dioxide, air_quality_raw.sulphur_dioxide
+            ),
+            ozone = COALESCE(EXCLUDED.ozone, air_quality_raw.ozone),
+            european_aqi = COALESCE(
+                EXCLUDED.european_aqi, air_quality_raw.european_aqi
+            ),
+            ingested_at = NOW(),
+            backfill_attempts = CASE
+                WHEN COALESCE(EXCLUDED.pm2_5, air_quality_raw.pm2_5) IS NOT NULL
+                 AND COALESCE(EXCLUDED.pm10, air_quality_raw.pm10) IS NOT NULL
+                THEN 0
+                ELSE air_quality_raw.backfill_attempts
+            END;
     """
 
     # "with" dipakai agar koneksi otomatis ditutup setelah blok selesai.
@@ -356,6 +487,34 @@ def upsert_raw_rows(rows: list[tuple]) -> int:
             execute_values(cur, upsert_sql, rows, page_size=500)
 
     return len(rows)
+
+
+def record_backfill_attempts(
+    city: str,
+    windows: list[tuple[datetime, datetime]],
+) -> None:
+    """Catat satu percobaan backfill untuk jam yang masih NULL.
+
+    Hanya baris tanpa pm2_5/pm10 yang dihitung. Baris yang berhasil terisi
+    tidak menambah counter, sehingga batas percobaan hanya menghabiskan jam
+    yang memang tidak tersedia di arsip.
+    """
+    if not windows:
+        return
+
+    with dw_connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                UPDATE staging.air_quality_raw
+                SET backfill_attempts = backfill_attempts + 1,
+                    last_backfill_at = NOW()
+                WHERE city = %s
+                  AND valid_at BETWEEN %s AND %s
+                  AND (pm2_5 IS NULL OR pm10 IS NULL)
+                """,
+                [(city, start, end) for start, end in windows],
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -405,11 +564,12 @@ def air_quality_pipeline():
 
     # Task ini berjalan lebih dulu, sebelum extract.
     #
-    # Kalau di gudang ada jam-hour yang kosong — misalnya pipeline mati
-    # beberapa hari, atau ada kota yang datanya baru mulai masuk — jam-jam itu
-    # diambil dari arsip Open-Meteo memakai parameter start_hour/end_hour.
-    # Berbeda dengan extract yang selalu meminta 30 hari penuh, di sini API
-    # hanya mengembalikan jam-jam yang benar-benar bolong.
+    # Kalau di gudang ada jam yang barisnya kosong — misalnya pipeline mati
+    # beberapa hari, atau ada kota yang datanya baru mulai masuk — atau jam
+    # yang pm2_5/pm10-nya masih NULL, jam-jam itu diambil dari arsip Open-Meteo
+    # memakai start_hour/end_hour. Percobaannya dibatasi dan diberi jeda
+    # (design.md D-018). Berbeda dengan extract yang selalu meminta 30 hari
+    # penuh, di sini API hanya diminta jam yang masih menjadi gap.
     #
     # retries=2 + execution_timeout:
     # task ini menyentuh jaringan, jadi wajib punya keduanya (AGENTS.md).
@@ -419,7 +579,10 @@ def air_quality_pipeline():
         execution_timeout=timedelta(minutes=15),
     )
     def backfill_historical() -> dict:
-        """Isi jam-hour yang kosong di raw staging dengan data historis."""
+        """Isi jam yang kosong atau pm2_5/pm10-nya NULL dengan data historis."""
+
+        # Gagal cepat sebelum menyentuh jaringan/database kalau env tidak valid.
+        validate_config()
 
         # Jalur batch bisa dimatikan dari dashboard (tab Pengaturan).
         # Kalau dimatikan, task ini di-skip dan skip mengcascade ke semua
@@ -439,59 +602,99 @@ def air_quality_pipeline():
         # dianggap di luar jangkauan backfill.
         oldest = now_floor - timedelta(days=BACKFILL_MAX_DAYS)
 
+        # Kolom/tabel baru mungkin belum ada di volume Postgres lama.
+        with dw_connection() as conn:
+            with conn.cursor() as cur:
+                ensure_batch_schema(cur)
+
         # Ringkasan per kota, dikembalikan sebagai XCom.
         summary = {}
 
         # Loop setiap kota pada CITIES.
         for location in CITIES:
 
-            # Jam-jam yang sudah ada di raw staging untuk kota ini.
+            # Ambil baris yang sudah ada beserta nilai dan riwayat backfill.
             with dw_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT valid_at
+                        SELECT valid_at, pm2_5, pm10, backfill_attempts,
+                               (last_backfill_at AT TIME ZONE 'Asia/Makassar')
                         FROM staging.air_quality_raw
                         WHERE city = %s AND valid_at BETWEEN %s AND %s
                         ORDER BY valid_at
                         """,
                         (location["city"], oldest, now_floor),
                     )
-                    existing = [row[0] for row in cur.fetchall()]
+                    raw_rows = cur.fetchall()
 
-            # Jam yang kosong, dikelompokkan jadi window berurutan supaya
-            # API hanya dipanggil sekali per lubuk.
-            windows = missing_windows(existing, oldest, now_floor)
+            # Jam yang barisnya sudah ada dan masih boleh dicoba ulang.
+            retry_hours = select_gaps(
+                raw_rows,
+                now_floor,
+                BACKFILL_MAX_ATTEMPTS,
+                BACKFILL_RETRY_COOLDOWN_HOURS,
+            )
+
+            # Jam yang sudah "beres" = ada barisnya dan tidak masuk retry.
+            # missing_windows() akan menganggap sisanya (baris tidak ada atau
+            # masih retry) sebagai lubang yang perlu diminta ke API.
+            settled = {row[0] for row in raw_rows} - retry_hours
+            windows = missing_windows(sorted(settled), oldest, now_floor)
+            gap_hours = count_missing_hours(sorted(settled), oldest, now_floor)
 
             # Kumpulkan baris dari semua window yang bolong.
             rows = []
+            filled = 0
+            empty = 0
             for gap_start, gap_end in windows:
-                rows.extend(
-                    fetch_hourly_rows(
-                        location,
-                        {
-                            # Open-Meteo menerima waktu ISO8601 dan
-                            # mengembalikan rentang itu inklusif di kedua
-                            # ujungnya.
-                            "start_hour": gap_start.strftime("%Y-%m-%dT%H:%M"),
-                            "end_hour": gap_end.strftime("%Y-%m-%dT%H:%M"),
-                        },
-                    )
+                window_rows = fetch_hourly_rows(
+                    location,
+                    {
+                        # Open-Meteo menerima waktu ISO8601 dan
+                        # mengembalikan rentang itu inklusif di kedua
+                        # ujungnya.
+                        "start_hour": gap_start.strftime("%Y-%m-%dT%H:%M"),
+                        "end_hour": gap_end.strftime("%Y-%m-%dT%H:%M"),
+                    },
+                    expected_window=(gap_start, gap_end),
+                )
+                rows.extend(window_rows)
+
+                # Hitung hasil yang benar-benar berisi, bukan sekadar baris.
+                for row in window_rows:
+                    if row[4] is not None and row[5] is not None:
+                        filled += 1
+                    else:
+                        empty += 1
+
+            # Validasi di fetch_hourly_rows menjamin jumlah ini; cek sekali
+            # lagi supaya ringkasan tidak pernah berbohong.
+            if len(rows) != gap_hours:
+                raise ValueError(
+                    f"Backfill {location['city']}: {len(rows)} baris "
+                    f"untuk {gap_hours} jam bolong"
                 )
 
             # Tulis ke raw staging. Idempotent, jadi aman saat task di-retry.
             upsert_raw_rows(rows)
 
-            gap_hours = count_missing_hours(existing, oldest, now_floor)
+            # Catat percobaan hanya untuk jam yang masih NULL. Baris yang
+            # berhasil terisi tidak menambah counter.
+            record_backfill_attempts(location["city"], windows)
+
             summary[location["city"]] = {
                 "windows": len(windows),
                 "gap_hours": gap_hours,
                 "rows": len(rows),
+                "filled": filled,
+                "empty": empty,
             }
 
             print(
                 f"[AIRFLOW] Backfill {location['city']}: "
-                f"{len(windows)} window, {gap_hours} jam bolong, {len(rows)} baris"
+                f"{len(windows)} window, {gap_hours} jam bolong, "
+                f"{filled} terisi, {empty} kosong"
             )
 
         return summary
@@ -695,13 +898,21 @@ def air_quality_pipeline():
         JOIN warehouse.dim_time t
           ON t.valid_at = c.valid_at
         ON CONFLICT (location_key, time_key) DO UPDATE SET
-            pm2_5 = EXCLUDED.pm2_5,
-            pm10 = EXCLUDED.pm10,
-            carbon_monoxide = EXCLUDED.carbon_monoxide,
-            nitrogen_dioxide = EXCLUDED.nitrogen_dioxide,
-            sulphur_dioxide = EXCLUDED.sulphur_dioxide,
-            ozone = EXCLUDED.ozone,
-            european_aqi = EXCLUDED.european_aqi,
+            pm2_5 = COALESCE(EXCLUDED.pm2_5, fact_air_quality.pm2_5),
+            pm10 = COALESCE(EXCLUDED.pm10, fact_air_quality.pm10),
+            carbon_monoxide = COALESCE(
+                EXCLUDED.carbon_monoxide, fact_air_quality.carbon_monoxide
+            ),
+            nitrogen_dioxide = COALESCE(
+                EXCLUDED.nitrogen_dioxide, fact_air_quality.nitrogen_dioxide
+            ),
+            sulphur_dioxide = COALESCE(
+                EXCLUDED.sulphur_dioxide, fact_air_quality.sulphur_dioxide
+            ),
+            ozone = COALESCE(EXCLUDED.ozone, fact_air_quality.ozone),
+            european_aqi = COALESCE(
+                EXCLUDED.european_aqi, fact_air_quality.european_aqi
+            ),
             loaded_at = NOW();
         """
 
@@ -793,7 +1004,7 @@ def air_quality_pipeline():
     # -----------------------------------------------------------------------
 
     @task
-    def quality_check() -> dict:
+    def quality_check(**context) -> dict:
         """Fail the DAG if critical warehouse quality rules are violated."""
 
         # Cara membaca fungsi ini:
@@ -805,14 +1016,28 @@ def air_quality_pipeline():
         # 3. fact table tidak boleh kosong.
         # 4. PM2.5, PM10, dan European AQI tidak boleh negatif.
         # 5. tidak boleh ada jam bolong di fact table (lihat task backfill).
+        # 6. minimal DQ_MIN_ML_HOURS jam berisi pm2_5 + pm10 dalam 30 hari.
         #
         # Jika rule gagal, raise ValueError membuat task gagal.
+
+        validate_config()
+
+        # run_id dipakai sebagai kunci log kualitas per run. Kalau task
+        # di-retry, baris yang sama diperbarui, bukan digandakan.
+        run_id = (
+            context.get("run_id")
+            or getattr(context.get("ti"), "run_id", None)
+            or "manual"
+        )
 
         # Buka koneksi database.
         with dw_connection() as conn:
 
             # Buat cursor.
             with conn.cursor() as cur:
+
+                # Kolom/tabel baru mungkin belum ada di volume Postgres lama.
+                ensure_batch_schema(cur)
 
                 # Hitung jumlah record raw staging.
                 cur.execute("SELECT COUNT(*) FROM staging.air_quality_raw")
@@ -862,7 +1087,7 @@ def air_quality_pipeline():
             raise ValueError(f"DQ failed: {invalid_rows} invalid negative rows")
 
         # -------------------------------------------------------------------
-        # RULE 5 — TIDAK BOLEH ADA JAM BOLONG DI FACT TABLE
+        # RULE 5 & 6 — JAM BOLONG DAN CAKUPAN NILAI
         # -------------------------------------------------------------------
 
         # Task backfill_historical sudah mencoba menutup setiap jam yang
@@ -870,10 +1095,12 @@ def air_quality_pipeline():
         # diisi dari arsip Open-Meteo, jadi pipeline harus gagal supaya
         # masalahnya terlihat, bukan diam-diam terbawa ke model ML.
         #
-        # Yang dicek adalah fact table, bukan raw staging, karena yang
-        # dipakai downstream (ML dan dashboard) adalah fact table.
+        # Baris yang ada tetapi pm2_5/pm10-nya NULL juga tidak berguna untuk
+        # ML. Karena itu DQ juga menuntut jumlah jam "usable" minimum dalam
+        # 30 hari terakhir, bukan hanya baris yang ada.
         now_floor = hour_floor_wita()
         oldest = now_floor - timedelta(days=BACKFILL_MAX_DAYS)
+        last_30d = now_floor - timedelta(days=30)
 
         # Total jam bolong di semua kota.
         gap_hours = 0
@@ -881,9 +1108,17 @@ def air_quality_pipeline():
         # Rincian per kota, dipakai di pesan error.
         gap_detail = []
 
-        for location in CITIES:
-            with dw_connection() as conn:
-                with conn.cursor() as cur:
+        # Kota yang cakupan nilai 30 harinya di bawah ambang.
+        usable_failures = []
+
+        # Ringkasan per kota untuk XCom.
+        metrics = {}
+
+        with dw_connection() as conn:
+            with conn.cursor() as cur:
+                for location in CITIES:
+                    city = location["city"]
+
                     cur.execute(
                         """
                         SELECT t.valid_at
@@ -895,21 +1130,169 @@ def air_quality_pipeline():
                         WHERE l.city = %s AND t.valid_at BETWEEN %s AND %s
                         ORDER BY t.valid_at
                         """,
-                        (location["city"], oldest, now_floor),
+                        (city, oldest, now_floor),
                     )
                     existing = [row[0] for row in cur.fetchall()]
+                    missing = count_missing_hours(existing, oldest, now_floor)
 
-            missing = count_missing_hours(existing, oldest, now_floor)
+                    # Klasifikasi isi fact per kota dalam jendela backfill.
+                    cur.execute(
+                        """
+                        SELECT
+                            COUNT(*),
+                            COUNT(*) FILTER (
+                                WHERE f.pm2_5 IS NOT NULL
+                                  AND f.pm10 IS NOT NULL
+                            ),
+                            COUNT(*) FILTER (
+                                WHERE num_nonnulls(
+                                    f.pm2_5, f.pm10, f.carbon_monoxide,
+                                    f.nitrogen_dioxide, f.sulphur_dioxide,
+                                    f.ozone, f.european_aqi
+                                ) = 0
+                            ),
+                            COUNT(*) FILTER (
+                                WHERE num_nonnulls(
+                                    f.pm2_5, f.pm10, f.carbon_monoxide,
+                                    f.nitrogen_dioxide, f.sulphur_dioxide,
+                                    f.ozone, f.european_aqi
+                                ) BETWEEN 1 AND 6
+                            )
+                        FROM warehouse.fact_air_quality f
+                        JOIN warehouse.dim_location l
+                          ON l.location_key = f.location_key
+                        JOIN warehouse.dim_time t
+                          ON t.time_key = f.time_key
+                        WHERE l.city = %s AND t.valid_at BETWEEN %s AND %s
+                        """,
+                        (city, oldest, now_floor),
+                    )
+                    (
+                        hours_present,
+                        hours_usable,
+                        hours_all_null,
+                        hours_partial,
+                    ) = cur.fetchone()
 
-            if missing > 0:
-                gap_hours += missing
-                gap_detail.append(f"{location['city']}={missing}")
+                    # Cakupan nilai yang benar-benar bisa dipakai ML.
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM warehouse.fact_air_quality f
+                        JOIN warehouse.dim_location l
+                          ON l.location_key = f.location_key
+                        JOIN warehouse.dim_time t
+                          ON t.time_key = f.time_key
+                        WHERE l.city = %s AND t.valid_at BETWEEN %s AND %s
+                          AND f.pm2_5 IS NOT NULL AND f.pm10 IS NOT NULL
+                        """,
+                        (city, last_30d, now_floor),
+                    )
+                    usable_30d = cur.fetchone()[0]
 
-        # Jika masih ada jam bolong, hentikan task.
+                    # Jam yang sudah dicoba maksimal tetapi tetap NULL.
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM staging.air_quality_raw
+                        WHERE city = %s AND valid_at BETWEEN %s AND %s
+                          AND (pm2_5 IS NULL OR pm10 IS NULL)
+                          AND backfill_attempts >= %s
+                        """,
+                        (city, oldest, now_floor, BACKFILL_MAX_ATTEMPTS),
+                    )
+                    known_unavailable = cur.fetchone()[0]
+
+                    if hours_all_null > 0:
+                        print(
+                            f"[AIRFLOW] DQ warning {city}: "
+                            f"{hours_all_null} jam semua polutan NULL"
+                        )
+                    if hours_partial > 0:
+                        print(
+                            f"[AIRFLOW] DQ warning {city}: "
+                            f"{hours_partial} jam sebagian polutan NULL"
+                        )
+                    if known_unavailable > 0:
+                        print(
+                            f"[AIRFLOW] DQ warning {city}: {known_unavailable} jam "
+                            f"tetap NULL setelah {BACKFILL_MAX_ATTEMPTS} percobaan"
+                        )
+
+                    if missing > 0:
+                        gap_hours += missing
+                        gap_detail.append(f"{city}={missing}")
+                    if usable_30d < DQ_MIN_ML_HOURS:
+                        usable_failures.append(f"{city}={usable_30d}")
+
+                    status = (
+                        "PASS"
+                        if missing == 0 and usable_30d >= DQ_MIN_ML_HOURS
+                        else "FAIL"
+                    )
+
+                    # Log per run: idempotent kalau task di-retry.
+                    cur.execute(
+                        """
+                        INSERT INTO staging.batch_quality_log (
+                            run_id, city, window_start, window_end,
+                            hours_present, hours_usable, hours_all_null,
+                            hours_partial, hours_missing, known_unavailable,
+                            usable_30d, status
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                        ON CONFLICT (run_id, city) DO UPDATE SET
+                            window_start = EXCLUDED.window_start,
+                            window_end = EXCLUDED.window_end,
+                            hours_present = EXCLUDED.hours_present,
+                            hours_usable = EXCLUDED.hours_usable,
+                            hours_all_null = EXCLUDED.hours_all_null,
+                            hours_partial = EXCLUDED.hours_partial,
+                            hours_missing = EXCLUDED.hours_missing,
+                            known_unavailable = EXCLUDED.known_unavailable,
+                            usable_30d = EXCLUDED.usable_30d,
+                            status = EXCLUDED.status,
+                            checked_at = NOW()
+                        """,
+                        (
+                            run_id,
+                            city,
+                            oldest,
+                            now_floor,
+                            hours_present,
+                            hours_usable,
+                            hours_all_null,
+                            hours_partial,
+                            missing,
+                            known_unavailable,
+                            usable_30d,
+                            status,
+                        ),
+                    )
+
+                    metrics[city] = {
+                        "hours_present": hours_present,
+                        "hours_usable": hours_usable,
+                        "hours_all_null": hours_all_null,
+                        "hours_partial": hours_partial,
+                        "hours_missing": missing,
+                        "known_unavailable": known_unavailable,
+                        "usable_30d": usable_30d,
+                    }
+
+        # Jika masih ada jam bolong, hentikan task setelah log ditulis.
         if gap_hours > 0:
             raise ValueError(
                 f"DQ failed: {gap_hours} jam bolong di warehouse.fact_air_quality "
                 f"({', '.join(gap_detail)})"
+            )
+
+        # Kalau isi fact ada tetapi nilainya tidak cukup untuk ML, gagal.
+        if usable_failures:
+            raise ValueError(
+                f"DQ failed: jam pm2_5+pm10 dalam 30 hari < {DQ_MIN_ML_HOURS} "
+                f"({', '.join(usable_failures)})"
             )
 
         # Jika semua pemeriksaan lolos, susun ringkasan hasil quality check.
@@ -919,6 +1302,7 @@ def air_quality_pipeline():
             "fact_rows": fact_rows,
             "invalid_rows": invalid_rows,
             "gap_hours": gap_hours,
+            "cities": metrics,
             "status": "PASS",
         }
 
