@@ -13,6 +13,7 @@ import os
 from contextlib import closing
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import psycopg2
 import pydeck as pdk
@@ -440,40 +441,97 @@ def render_analytics() -> None:
 
 # ---------------------------------------------------------------- jalur ML (E4)
 
+def chart_series(values: pd.DataFrame) -> pd.DataFrame:
+    return pd.concat([
+        pd.DataFrame({
+            "waktu": values.index, "nilai": values[label].values, "seri": label,
+            "segmen": values[label].isna().cumsum().values,
+        })
+        for label in values.columns
+    ], ignore_index=True).dropna(subset=["nilai"])
+
+
 def render_ml() -> None:
     if st.button("Muat ulang data", key="ml_reload"):
         st.rerun()
 
+    metric_horizon = st.selectbox(
+        "Horizon metrik", range(1, 7), index=5, format_func=lambda h: f"+{h} jam"
+    )
+
     try:
-        evaluated = query("""
-            SELECT run_id, n_evaluated, mae_model, mae_persistence, mae_cams
+        evaluated = query(f"""
+            SELECT run_id, horizon_hours, n_evaluated, mae_model, mae_persistence, mae_cams
             FROM warehouse.ml_metrics
-            WHERE n_evaluated > 0
+            WHERE n_evaluated > 0 AND horizon_hours = {metric_horizon}
             ORDER BY updated_at DESC
             LIMIT 1
         """)
-        holdout = query("""
+        holdout = query(f"""
             SELECT DISTINCT ON (city)
-                city, model_version, train_rows, holdout_rows,
+                city, horizon_hours, model_version, train_rows, holdout_rows,
                 holdout_mae_model, holdout_mae_persistence, trained_at
             FROM warehouse.ml_model
+            WHERE horizon_hours = {metric_horizon}
             ORDER BY city, trained_at DESC
         """)
+        backtest_available = query(
+            "SELECT to_regclass('warehouse.ml_backtest') IS NOT NULL AS available"
+        ).iloc[0]["available"]
         preds = query("""
-            SELECT target_at, city, predicted_pm2_5, persistence_pm2_5, cams_pm2_5, actual_pm2_5
-            FROM warehouse.ml_prediction
-            WHERE target_at >= (NOW() AT TIME ZONE 'Asia/Makassar') - INTERVAL '48 hours'
-            ORDER BY target_at
-        """)
-        history = query("""
-            SELECT run_id, model_version, n_evaluated, mae_model, mae_persistence, mae_cams
+            SELECT p.city, p.origin_at, p.run_id, hours.valid_at,
+                   f.pm2_5, h.predicted_pm2_5 AS historical_model,
+                   h.cams_pm2_5 AS historical_cams, b.predicted_pm2_5 AS simulated_model,
+                   future.predicted_pm2_5, future.cams_pm2_5
+            FROM (
+                SELECT DISTINCT ON (city) city, origin_at, run_id
+                FROM warehouse.ml_prediction
+                ORDER BY city, created_at DESC, prediction_id DESC
+            ) p
+            CROSS JOIN LATERAL generate_series(
+                p.origin_at - INTERVAL '5 hours', p.origin_at + INTERVAL '6 hours',
+                INTERVAL '1 hour'
+            ) AS hours(valid_at)
+            LEFT JOIN warehouse.dim_location l ON l.city = p.city
+            LEFT JOIN warehouse.dim_time t
+                ON t.valid_at = hours.valid_at
+                AND t.valid_at <= (NOW() AT TIME ZONE 'Asia/Makassar')
+            LEFT JOIN warehouse.fact_air_quality f
+                ON f.location_key = l.location_key AND f.time_key = t.time_key
+            LEFT JOIN warehouse.ml_prediction future
+                ON future.city = p.city AND future.run_id = p.run_id
+                AND future.origin_at = p.origin_at AND future.target_at = hours.valid_at
+                AND future.target_at > p.origin_at
+            LEFT JOIN __BACKTEST_SOURCE__ b
+                ON b.city = p.city AND b.target_at = hours.valid_at
+            LEFT JOIN LATERAL (
+                SELECT predicted_pm2_5, cams_pm2_5
+                FROM warehouse.ml_prediction h
+                WHERE h.city = p.city AND h.target_at = hours.valid_at
+                  AND h.target_at = h.origin_at + INTERVAL '6 hours'
+                  AND (h.created_at AT TIME ZONE 'Asia/Makassar') < h.target_at
+                ORDER BY h.created_at DESC, h.prediction_id DESC
+                LIMIT 1
+            ) h ON TRUE
+            ORDER BY p.city, hours.valid_at
+        """.replace(
+            "__BACKTEST_SOURCE__",
+            "warehouse.ml_backtest" if backtest_available else
+            "(SELECT NULL::text AS city, NULL::timestamp AS target_at, "
+            "NULL::double precision AS predicted_pm2_5 WHERE FALSE)",
+        ))
+        cities = read_cities()
+        history = query(f"""
+            SELECT run_id, horizon_hours, model_version, n_evaluated,
+                   mae_model, mae_persistence, mae_cams
             FROM warehouse.ml_metrics
-            WHERE n_evaluated > 0
+            WHERE n_evaluated > 0 AND horizon_hours = {metric_horizon}
             ORDER BY updated_at DESC
             LIMIT 10
         """)
         recent = query("""
-            SELECT created_at, city, target_at, predicted_pm2_5, persistence_pm2_5, cams_pm2_5, actual_pm2_5
+            SELECT created_at, city, origin_at, target_at, horizon_hours,
+                   predicted_pm2_5, persistence_pm2_5, cams_pm2_5, actual_pm2_5
             FROM warehouse.ml_prediction
             ORDER BY created_at DESC, target_at
             LIMIT 20
@@ -493,13 +551,10 @@ def render_ml() -> None:
             JOIN warehouse.dim_time t USING (time_key)
         """).iloc[0]
     except (psycopg2.Error, OSError) as exc:
-        st.warning("Tabel ML belum siap. Pastikan DAG air_quality_ml sudah pernah berjalan.")
+        st.error("Gagal membaca data ML dari warehouse. Periksa detail berikut.")
         st.code(str(exc))
         return
 
-    if preds.empty and holdout.empty:
-        st.info("Belum ada hasil ML. Jalankan DAG air_quality_ml di Airflow (butuh riwayat batch), lalu klik Muat ulang data.")
-        return
 
     def mae(value) -> str:
         return "—" if pd.isna(value) else f"{value:.2f}"
@@ -518,7 +573,7 @@ def render_ml() -> None:
         k3.metric("MAE persistence", mae(row["mae_persistence"]))
         k4.metric("MAE CAMS", mae(row["mae_cams"]))
         k5.metric("Data di warehouse", volume_label)
-        st.caption(f"MAE walk-forward kumulatif run `{row['run_id']}`: model, baseline persistence, dan forecast CAMS dinilai pada himpunan jam target yang sama setelah targetnya lewat.")
+        st.caption(f"MAE walk-forward horizon +{metric_horizon} jam, run `{row['run_id']}`: model, persistence, dan CAMS dinilai pada himpunan target yang sama setelah target lewat.")
     else:
         valid = holdout.dropna(subset=["holdout_mae_model"])
         k1, k2, k3, k4, k5 = st.columns(5)
@@ -528,27 +583,68 @@ def render_ml() -> None:
         trained = pd.to_datetime(holdout["trained_at"]).max() if not holdout.empty else None
         k4.metric("Training terakhir (WITA)", trained.tz_convert("Asia/Makassar").strftime("%d/%m %H:%M") if trained is not None else "—")
         k5.metric("Data di warehouse", volume_label)
-        st.caption("Belum ada prediksi matang untuk dinilai (butuh ±9 jam sejak run pertama). Angka di atas = MAE holdout 48 jam terakhir, rata-rata kota.")
+        st.caption(f"Belum ada prediksi horizon +{metric_horizon} jam yang matang untuk dinilai (target ditambah jeda 3 jam). Angka di atas = MAE holdout 48 jam terakhir, rata-rata kota.")
 
-    st.subheader("Prediksi vs aktual vs persistence vs CAMS")
-    if preds.empty:
-        st.info("Belum ada prediksi tersimpan dalam 48 jam terakhir.")
+    st.subheader("PM2.5 enam jam historis dan prediksi enam jam ke depan")
+    if not backtest_available:
+        st.info("Simulasi historis belum tersedia. Jalankan DAG air_quality_ml lalu muat ulang.")
+    if not cities:
+        st.info("Belum ada kota di warehouse. Jalankan DAG batch, lalu muat ulang data.")
     else:
-        city = st.selectbox("Pilih kota", sorted(preds["city"].unique().tolist()), key="ml_city")
-        view = preds.loc[preds["city"] == city].copy()
-        view["target_at"] = pd.to_datetime(view["target_at"])
-        chart = view.pivot_table(
-            index="target_at",
-            values=["predicted_pm2_5", "persistence_pm2_5", "cams_pm2_5", "actual_pm2_5"],
-            aggfunc="mean",
-        ).rename(columns={
-            "predicted_pm2_5": "Prediksi model",
-            "persistence_pm2_5": "Persistence",
-            "cams_pm2_5": "CAMS",
-            "actual_pm2_5": "Aktual",
-        })
-        st.line_chart(chart, x_label="Waktu (WITA)", y_label="PM2.5 (µg/m³)")
-        st.caption("48 jam terakhir sampai 6 jam ke depan. Garis aktual berhenti di jam sekarang; tiga garis lain adalah ramalan yang dibuat enam jam sebelum jam target.")
+        city = st.selectbox("Pilih kota", cities, key="ml_city")
+        view = preds.loc[preds["city"] == city]
+        if view.empty:
+            st.info(
+                "Belum ada prediksi untuk kota ini. "
+                "Periksa data batch dan jalankan DAG air_quality_ml, lalu muat ulang."
+            )
+        else:
+            prediction = view.iloc[0]
+            origin = pd.Timestamp(prediction["origin_at"])
+            values = view.set_index("valid_at")[
+                ["pm2_5", "historical_model", "historical_cams", "simulated_model",
+                 "predicted_pm2_5", "cams_pm2_5"]
+            ]
+            values.index = pd.to_datetime(values.index)
+            values = values.reindex(pd.date_range(start=origin - pd.Timedelta(hours=5),
+                                                  periods=12, freq="h"))
+            values.loc[values.index > origin,
+                       ["pm2_5", "historical_model", "historical_cams", "simulated_model"]] = None
+            values.loc[values.index <= origin, ["predicted_pm2_5", "cams_pm2_5"]] = None
+            values.columns = [
+                "Data aktual", "Model historis operasional +6", "CAMS historis +6",
+                "Simulasi historis +6", "Prediksi model", "CAMS",
+            ]
+            for label in values.columns:
+                column = values[label]
+                count = column.notna().sum()
+                if count < 6 and label not in ("Model historis operasional +6", "CAMS historis +6"):
+                    st.info(f"{label}: {count} dari 6 jam tersedia; jam kosong tidak diisi.")
+            if pd.notna(values.loc[origin, "Data aktual"]):
+                for label in ("Prediksi model", "CAMS"):
+                    if pd.notna(values.loc[origin + pd.Timedelta(hours=1), label]):
+                        values.loc[origin, label] = values.loc[origin, "Data aktual"]
+            chart = chart_series(values)
+            if not chart.empty:
+                plot = alt.Chart(chart).mark_line(point=True).encode(
+                    x=alt.X("waktu:T", title="Waktu (WITA)"),
+                    y=alt.Y("nilai:Q", title="PM2.5 (µg/m³)"),
+                    color=alt.Color("seri:N", title="Seri"),
+                    detail="segmen:N",
+                )
+                st.altair_chart(plot, use_container_width=True)
+            else:
+                st.info("Tidak ada nilai historis atau prediksi yang dapat digambar untuk run ini.")
+            st.caption(
+                f"Run `{prediction['run_id']}`; asal: {origin:%d/%m/%Y %H:%M} WITA; "
+                "target +1 sampai +6 jam. Fakta historis adalah Open-Meteo/CAMS, bukan sensor lapangan. "
+                "Model historis operasional dan CAMS historis adalah snapshot horizon +6 terbaru "
+                "sebelum tiap target; titik dapat berasal dari run berbeda. Simulasi historis +6 "
+                "dilatih ulang per target menggunakan histori warehouse saat ini, "
+                "yang mungkin telah direvisi; ini bukan snapshot data pada waktu simulasi "
+                "dan tidak masuk metrik operasional. Garis prediksi dimulai dari data aktual "
+                "pada waktu asal; celah berarti nilai tidak tersedia."
+            )
 
     st.subheader("20 prediksi terbaru")
     if recent.empty:
@@ -559,7 +655,7 @@ def render_ml() -> None:
 
     st.subheader("Riwayat MAE per run evaluasi")
     if history.empty:
-        st.info("Belum ada run yang selesai dievaluasi. Evaluasi walk-forward butuh ±9 jam sejak prediksi pertama.")
+        st.info(f"Belum ada evaluasi horizon +{metric_horizon} jam. Evaluasi memerlukan target yang telah lewat dan jeda 3 jam.")
     else:
         history[["mae_model", "mae_persistence", "mae_cams"]] = history[["mae_model", "mae_persistence", "mae_cams"]].round(2)
         st.dataframe(history, width="stretch", hide_index=True)
@@ -570,7 +666,7 @@ def render_ml() -> None:
     else:
         observations["valid_at"] = pd.to_datetime(observations["valid_at"])
         st.dataframe(observations, width="stretch", hide_index=True)
-        st.caption("Baris faktual yang dipakai sebagai bahan latih dan sebagai pembanding 'aktual' di grafik di atas. Nilai kosong tetap kosong, jangan ditafsirkan sebagai nol.")
+        st.caption("Fact table juga memuat forecast masa depan. Nilai kosong tetap kosong, jangan ditafsirkan sebagai nol.")
 
 
 # ---------------------------------------------------------------- pengaturan jalur
@@ -737,7 +833,7 @@ with tab_analytics:
     )
     render_analytics()
 with tab_ml:
-    st.caption("Jalur ML (E4): model ridge per kota → prediksi PM2.5 enam jam ke depan, dibandingkan baseline persistence dan forecast CAMS. Diperbarui tiap run DAG air_quality_ml (tiap jam).")
+    st.caption("Jalur ML (E4): model ridge per kota dan horizon +1 sampai +6 jam, dibandingkan baseline persistence dan forecast CAMS. Diperbarui tiap run DAG air_quality_ml (tiap jam).")
     render_ml()
 with tab_settings:
     st.caption("Kontrol on/off tiap jalur pipeline. Perubahan berlaku pada run berikutnya.")

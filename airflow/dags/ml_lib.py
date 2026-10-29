@@ -13,6 +13,7 @@ perhitungan fitur di kedua sisi selalu identik (mencegah training/serving skew).
 from __future__ import annotations
 
 import math
+from datetime import datetime, timedelta
 
 import numpy as np
 from sklearn.linear_model import Ridge
@@ -30,6 +31,14 @@ DOW_INDEX = {
     "monday": 1, "tuesday": 2, "wednesday": 3, "thursday": 4,
     "friday": 5, "saturday": 6, "sunday": 7,
 }
+
+BACKTEST_ANCHORS_SQL = """
+    SELECT DISTINCT ON (city) city, origin_at
+    FROM warehouse.ml_prediction
+    WHERE target_at > (clock_timestamp() AT TIME ZONE 'Asia/Makassar')
+      AND horizon_hours = 6
+    ORDER BY city, created_at DESC, prediction_id DESC
+"""
 
 
 def cyclic(value, period):
@@ -114,6 +123,48 @@ def predict_ridge(model, row):
     return float(ridge.predict(scaler.transform([np.asarray(row, dtype=float)]))[0])
 
 
+def backtest_predictions(
+    rows: list[dict], anchors: dict[str, datetime], horizon: int, holdout: int,
+    min_rows: int, lam: float, half_life: int,
+) -> list[tuple]:
+    """Simulasikan enam target per kota dari fitur warehouse saat ini."""
+    by_city: dict[str, list[dict]] = {}
+    for row in rows:
+        if all(row[name] is not None for name in FEATURE_COLUMNS):
+            by_city.setdefault(row["city"], []).append(row)
+
+    predictions = []
+    for city, live_origin in anchors.items():
+        city_rows = by_city.get(city, [])
+        by_origin = {row["origin_at"]: row for row in city_rows}
+        for offset in range(5, -1, -1):
+            target = live_origin - timedelta(hours=offset)
+            origin = target - timedelta(hours=horizon)
+            candidate = by_origin.get(origin)
+            if candidate is None or candidate["target_at"] != target:
+                continue
+            cutoff = origin - timedelta(hours=holdout)
+            training = [
+                row for row in city_rows
+                if row["label_pm2_5"] is not None
+                and row["target_at"] <= origin and row["origin_at"] <= cutoff
+            ]
+            if len(training) < min_rows:
+                continue
+            inputs = [model_input(row, row["target_hour"], row["target_dow"]) for row in training]
+            labels = [float(row["label_pm2_5"]) for row in training]
+            weights = [
+                0.5 ** ((origin - row["origin_at"]).total_seconds() / 3600 / half_life)
+                for row in training
+            ]
+            model = fit_ridge(inputs, labels, lam, weights=weights)
+            predicted = predict_ridge(
+                model, model_input(candidate, candidate["target_hour"], candidate["target_dow"])
+            )
+            predictions.append((city, target, origin, predicted))
+    return predictions
+
+
 def _self_check():
     """Pemeriksaan cepat tanpa framework: python ml_lib.py"""
     import random
@@ -149,6 +200,34 @@ def _self_check():
     # 5. Baris input model punya panjang fitur + 4 kolom waktu.
     sample = {name: 1.0 for name in FEATURE_COLUMNS}
     assert len(model_input(sample, 12, "Sunday")) == len(FEATURE_COLUMNS) + 4
+
+    # Cutoff dan minimal training diperiksa pada simulasi model sesungguhnya.
+    anchor = datetime(2026, 1, 10)
+    origin = anchor - timedelta(hours=6)
+    sample_row = {**sample, "city": "x", "target_hour": 0, "target_dow": "Monday",
+                  "label_pm2_5": 10.0}
+    training = [
+        {**sample_row, "origin_at": origin - timedelta(hours=48 + i),
+         "target_at": origin - timedelta(hours=42 + i)}
+        for i in range(24)
+    ]
+    candidate = {**sample_row, "origin_at": origin, "target_at": anchor}
+    assert len(backtest_predictions(training + [candidate], {"x": anchor}, 6, 48, 24, 1, 168)) == 1
+    assert not backtest_predictions(training[1:] + [candidate], {"x": anchor}, 6, 48, 24, 1, 168)
+    assert not backtest_predictions(training + [{**candidate, "lag_0": None}],
+                                    {"x": anchor}, 6, 48, 24, 1, 168)
+
+    import ast
+    from pathlib import Path
+
+    dag = ast.parse(Path(__file__).with_name("air_quality_ml.py").read_text(encoding="utf-8"))
+    feature_sql = next(node.value.value for node in dag.body if isinstance(node, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == "FEATURES_SQL"
+                               for t in node.targets))
+    assert "GENERATE_SERIES(1, 6)" in feature_sql
+    assert "o.origin_at + h.horizon_hours * INTERVAL '1 hour'" in feature_sql
+    assert "RANGE BETWEEN INTERVAL '23 hours' PRECEDING AND CURRENT ROW" in feature_sql
+    assert "horizon_hours = 6" in BACKTEST_ANCHORS_SQL
 
     print("[ML-LIB] Self-check lolos")
 

@@ -1,7 +1,7 @@
 # AIR QUALITY ML
 # DAG Airflow (E4): model prediksi PM2.5 enam jam ke depan per kota.
 #
-# ALUR (empat task)
+# ALUR (lima task)
 # =================
 # 1. build_features        : rakit tabel fitur dari fact_air_quality + dim_time.
 # 2. train_model           : latih ridge regression per kota dengan split
@@ -11,6 +11,7 @@
 #                            waktu pembuatannya.
 # 4. evaluate_predictions  : isi nilai aktual setelah jam target lewat, lalu
 #                            hitung MAE tiga pendekatan ke ml_metrics.
+# 5. simulate_backtest     : simulasi historis terpisah dari prediksi operasional.
 #
 # KEPUTUSAN PENTING
 # =================
@@ -39,7 +40,10 @@ from airflow.sdk import dag, task
 from airflow.sdk.exceptions import AirflowSkipException
 from psycopg2.extras import Json, RealDictCursor
 
-from ml_lib import FEATURE_COLUMNS, fit_ridge, model_input, predict_ridge
+from ml_lib import (
+    BACKTEST_ANCHORS_SQL, FEATURE_COLUMNS, backtest_predictions, fit_ridge, model_input,
+    predict_ridge,
+)
 
 # ---------------------------------------------------------------------------
 # KONFIGURASI
@@ -65,6 +69,7 @@ DDL = """
 CREATE TABLE IF NOT EXISTS warehouse.ml_features (
     city TEXT NOT NULL,
     origin_at TIMESTAMP NOT NULL,
+    horizon_hours INT NOT NULL DEFAULT 6,
     lag_0 DOUBLE PRECISION,
     lag_1 DOUBLE PRECISION,
     lag_2 DOUBLE PRECISION,
@@ -78,7 +83,7 @@ CREATE TABLE IF NOT EXISTS warehouse.ml_features (
     target_dow TEXT NOT NULL,
     label_pm2_5 DOUBLE PRECISION,
     built_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (city, origin_at)
+    PRIMARY KEY (city, origin_at, horizon_hours)
 );
 
 CREATE TABLE IF NOT EXISTS warehouse.ml_model (
@@ -98,7 +103,7 @@ CREATE TABLE IF NOT EXISTS warehouse.ml_model (
     holdout_mae_model DOUBLE PRECISION,
     holdout_mae_persistence DOUBLE PRECISION,
     trained_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (model_version, city)
+    PRIMARY KEY (model_version, city, horizon_hours)
 );
 
 CREATE TABLE IF NOT EXISTS warehouse.ml_prediction (
@@ -107,6 +112,7 @@ CREATE TABLE IF NOT EXISTS warehouse.ml_prediction (
     model_version TEXT NOT NULL,
     city TEXT NOT NULL,
     origin_at TIMESTAMP NOT NULL,
+    horizon_hours INT NOT NULL DEFAULT 6,
     target_at TIMESTAMP NOT NULL,
     predicted_pm2_5 DOUBLE PRECISION,
     persistence_pm2_5 DOUBLE PRECISION,
@@ -118,7 +124,7 @@ CREATE TABLE IF NOT EXISTS warehouse.ml_prediction (
 );
 
 CREATE TABLE IF NOT EXISTS warehouse.ml_metrics (
-    run_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
     model_version TEXT,
     horizon_hours INT NOT NULL,
     n_predictions INT NOT NULL,
@@ -126,8 +132,54 @@ CREATE TABLE IF NOT EXISTS warehouse.ml_metrics (
     mae_model DOUBLE PRECISION,
     mae_persistence DOUBLE PRECISION,
     mae_cams DOUBLE PRECISION,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (run_id, horizon_hours)
 );
+
+CREATE TABLE IF NOT EXISTS warehouse.ml_backtest (
+    city TEXT NOT NULL,
+    target_at TIMESTAMP NOT NULL,
+    origin_at TIMESTAMP NOT NULL,
+    predicted_pm2_5 DOUBLE PRECISION NOT NULL,
+    simulated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (city, target_at)
+);
+
+DO $$
+DECLARE
+    item RECORD;
+    old_pk TEXT;
+BEGIN
+    FOR item IN SELECT unnest(ARRAY['ml_features', 'ml_prediction']) AS table_name
+    LOOP
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = format('warehouse.%I', item.table_name)::regclass
+              AND attname = 'horizon_hours' AND NOT attisdropped
+        ) THEN
+            EXECUTE format(
+                'ALTER TABLE warehouse.%I ADD COLUMN horizon_hours INT NOT NULL DEFAULT 6',
+                item.table_name
+            );
+        END IF;
+    END LOOP;
+    FOR item IN SELECT * FROM (VALUES
+        ('ml_features', 'PRIMARY KEY (city, origin_at, horizon_hours)'),
+        ('ml_model', 'PRIMARY KEY (model_version, city, horizon_hours)'),
+        ('ml_metrics', 'PRIMARY KEY (run_id, horizon_hours)')
+    ) AS keys(table_name, definition)
+    LOOP
+        SELECT conname INTO old_pk FROM pg_constraint
+        WHERE conrelid = format('warehouse.%I', item.table_name)::regclass
+          AND contype = 'p' AND pg_get_constraintdef(oid) <> item.definition;
+        IF old_pk IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE warehouse.%I DROP CONSTRAINT %I',
+                           item.table_name, old_pk);
+            EXECUTE format('ALTER TABLE warehouse.%I ADD %s', item.table_name, item.definition);
+        END IF;
+    END LOOP;
+END;
+$$;
 
 CREATE INDEX IF NOT EXISTS idx_ml_prediction_target
     ON warehouse.ml_prediction(target_at);
@@ -139,61 +191,62 @@ CREATE INDEX IF NOT EXISTS idx_ml_prediction_target
 # Semua lag diambil lewat join timestamp persis (bukan LAG berbasis baris),
 # sehingga tetap benar kalau ada jam yang bolong. Rata-rata bergerak memakai
 # window RANGE berbasis waktu untuk alasan yang sama.
-# Fitur waktu (target_hour, target_dow) diambil dari dim_time pada jam target.
+# Fitur waktu dihitung dari jam target WITA naive.
 # Kolom label_pm2_5 memang nilai masa depan; kolom ini hanya dipakai training,
 # tidak pernah dipakai scoring.
 
 FEATURES_SQL = """
 INSERT INTO warehouse.ml_features (
-    city, origin_at,
+    city, origin_at, horizon_hours,
     lag_0, lag_1, lag_2, lag_3, lag_6,
     roll_mean_6, roll_mean_24, pm10_0,
     target_at, target_hour, target_dow, label_pm2_5
 )
-SELECT
-    l.city,
-    t.valid_at,
-    o.pm2_5,
-    f1.pm2_5,
-    f2.pm2_5,
-    f3.pm2_5,
-    f6l.pm2_5,
-    AVG(o.pm2_5) OVER w6,
-    AVG(o.pm2_5) OVER w24,
-    o.pm10,
-    t6.valid_at,
-    t6.hour,
-    t6.day_of_week,
-    f6.pm2_5
-FROM warehouse.fact_air_quality o
-JOIN warehouse.dim_location l ON l.location_key = o.location_key
-JOIN warehouse.dim_time t ON t.time_key = o.time_key
-JOIN warehouse.dim_time t6 ON t6.valid_at = t.valid_at + INTERVAL '6 hours'
-LEFT JOIN warehouse.fact_air_quality f1
-    ON f1.location_key = o.location_key
-   AND f1.time_key = TO_CHAR(t.valid_at - INTERVAL '1 hour', 'YYYYMMDDHH24')::BIGINT
-LEFT JOIN warehouse.fact_air_quality f2
-    ON f2.location_key = o.location_key
-   AND f2.time_key = TO_CHAR(t.valid_at - INTERVAL '2 hours', 'YYYYMMDDHH24')::BIGINT
-LEFT JOIN warehouse.fact_air_quality f3
-    ON f3.location_key = o.location_key
-   AND f3.time_key = TO_CHAR(t.valid_at - INTERVAL '3 hours', 'YYYYMMDDHH24')::BIGINT
-LEFT JOIN warehouse.fact_air_quality f6l
-    ON f6l.location_key = o.location_key
-   AND f6l.time_key = TO_CHAR(t.valid_at - INTERVAL '6 hours', 'YYYYMMDDHH24')::BIGINT
-LEFT JOIN warehouse.fact_air_quality f6
-    ON f6.location_key = o.location_key
-   AND f6.time_key = TO_CHAR(t.valid_at + INTERVAL '6 hours', 'YYYYMMDDHH24')::BIGINT
-WHERE o.pm2_5 IS NOT NULL
-WINDOW
-    w6 AS (
-        PARTITION BY l.city ORDER BY t.valid_at
-        RANGE BETWEEN INTERVAL '5 hours' PRECEDING AND CURRENT ROW
-    ),
-    w24 AS (
-        PARTITION BY l.city ORDER BY t.valid_at
-        RANGE BETWEEN INTERVAL '23 hours' PRECEDING AND CURRENT ROW
-    )
+WITH origins AS (
+    SELECT l.city, o.location_key, t.valid_at AS origin_at,
+           o.pm2_5 AS lag_0, f1.pm2_5 AS lag_1, f2.pm2_5 AS lag_2,
+           f3.pm2_5 AS lag_3, f6l.pm2_5 AS lag_6,
+           AVG(o.pm2_5) OVER w6 AS roll_mean_6,
+           AVG(o.pm2_5) OVER w24 AS roll_mean_24, o.pm10 AS pm10_0
+    FROM warehouse.fact_air_quality o
+    JOIN warehouse.dim_location l ON l.location_key = o.location_key
+    JOIN warehouse.dim_time t ON t.time_key = o.time_key
+    LEFT JOIN warehouse.fact_air_quality f1
+        ON f1.location_key = o.location_key
+       AND f1.time_key = TO_CHAR(t.valid_at - INTERVAL '1 hour', 'YYYYMMDDHH24')::BIGINT
+    LEFT JOIN warehouse.fact_air_quality f2
+        ON f2.location_key = o.location_key
+       AND f2.time_key = TO_CHAR(t.valid_at - INTERVAL '2 hours', 'YYYYMMDDHH24')::BIGINT
+    LEFT JOIN warehouse.fact_air_quality f3
+        ON f3.location_key = o.location_key
+       AND f3.time_key = TO_CHAR(t.valid_at - INTERVAL '3 hours', 'YYYYMMDDHH24')::BIGINT
+    LEFT JOIN warehouse.fact_air_quality f6l
+        ON f6l.location_key = o.location_key
+       AND f6l.time_key = TO_CHAR(t.valid_at - INTERVAL '6 hours', 'YYYYMMDDHH24')::BIGINT
+    WHERE o.pm2_5 IS NOT NULL
+    WINDOW
+        w6 AS (
+            PARTITION BY l.city ORDER BY t.valid_at
+            RANGE BETWEEN INTERVAL '5 hours' PRECEDING AND CURRENT ROW
+        ),
+        w24 AS (
+            PARTITION BY l.city ORDER BY t.valid_at
+            RANGE BETWEEN INTERVAL '23 hours' PRECEDING AND CURRENT ROW
+        )
+)
+SELECT o.city, o.origin_at, h.horizon_hours,
+       o.lag_0, o.lag_1, o.lag_2, o.lag_3, o.lag_6,
+       o.roll_mean_6, o.roll_mean_24, o.pm10_0,
+       target.target_at, EXTRACT(HOUR FROM target.target_at)::SMALLINT,
+       TRIM(TO_CHAR(target.target_at, 'Day')), label.pm2_5
+FROM origins o
+CROSS JOIN GENERATE_SERIES(1, 6) AS h(horizon_hours)
+CROSS JOIN LATERAL (
+    SELECT o.origin_at + h.horizon_hours * INTERVAL '1 hour' AS target_at
+) target
+LEFT JOIN warehouse.fact_air_quality label
+    ON label.location_key = o.location_key
+   AND label.time_key = TO_CHAR(target.target_at, 'YYYYMMDDHH24')::BIGINT
 """
 
 # Klep versi fitur (urutan harus sama dengan ml_lib.FEATURE_COLUMNS).
@@ -265,7 +318,7 @@ def air_quality_ml():
     # -----------------------------------------------------------------------
     @task
     def build_features() -> dict:
-        """Rakit ulang warehouse.ml_features dari fact dan dimensi."""
+        """Rakit ulang fitur untuk setiap origin dan horizon 1–6 jam."""
         # Jalur ML bisa dimatikan dari dashboard (tab Pengaturan). Kalau
         # dimatikan, task ini di-skip dan seluruh DAG ter-lewati, jadi
         # ml_features tidak di-truncate dan tidak ada prediksi baru.
@@ -280,7 +333,7 @@ def air_quality_ml():
             cur.execute(FEATURES_SQL)
             cur.execute("SELECT COUNT(*) AS total FROM warehouse.ml_features")
             rows = cur.fetchone()["total"]
-        print(f"[ML] ml_features dibangun ulang: {rows} baris origin")
+        print(f"[ML] ml_features dibangun ulang: {rows} baris origin-horizon")
         return {"feature_rows": rows}
 
     # -----------------------------------------------------------------------
@@ -288,9 +341,9 @@ def air_quality_ml():
     # -----------------------------------------------------------------------
     @task
     def train_model(features_info: dict) -> dict:
-        """Latih satu model ridge per kota, split berbasis waktu.
+        """Latih model ridge per kota dan horizon, split berbasis waktu.
 
-        Train   : origin <= sekarang - 48 jam, label sudah terbentuk.
+        Train   : target <= sekarang - 48 jam, label sudah terbentuk.
         Holdout : origin 48 jam terakhir, dipakai hanya untuk laporan bersih
                   (model tidak dilatih pada rentang ini).
         """
@@ -305,7 +358,7 @@ def air_quality_ml():
             cur.execute(DDL)
             cur.execute(
                 f"""
-                SELECT city, origin_at, target_at, target_hour, target_dow,
+                SELECT city, horizon_hours, origin_at, target_at, target_hour, target_dow,
                        {", ".join(FEATURE_COLUMNS)}, label_pm2_5
                 FROM warehouse.ml_features
                 WHERE {PURE_FEATURES}
@@ -313,16 +366,16 @@ def air_quality_ml():
                   AND target_at <= %s
                   AND origin_at <= %s
                 """,
-                (now_floor, cutoff),
+                (cutoff, cutoff),
             )
-            per_city: dict[str, list] = {}
+            per_city_horizon: dict[tuple[str, int], list] = {}
             for row in cur.fetchall():
-                per_city.setdefault(row["city"], []).append(row)
+                per_city_horizon.setdefault((row["city"], row["horizon_hours"]), []).append(row)
 
-            for city, rows in sorted(per_city.items()):
+            for (city, horizon), rows in sorted(per_city_horizon.items()):
                 if len(rows) < MIN_TRAIN_ROWS:
-                    skipped.append(city)
-                    print(f"[ML] {city}: data training kurang ({len(rows)} < {MIN_TRAIN_ROWS}), dilewati")
+                    skipped.append((city, horizon))
+                    print(f"[ML] {city} +{horizon}h: data training kurang ({len(rows)} < {MIN_TRAIN_ROWS}), dilewati")
                     continue
 
                 x_train = [
@@ -346,12 +399,12 @@ def air_quality_ml():
                     f"""
                     SELECT target_hour, target_dow, {", ".join(FEATURE_COLUMNS)}, label_pm2_5
                     FROM warehouse.ml_features
-                    WHERE city = %s AND {PURE_FEATURES}
+                    WHERE city = %s AND horizon_hours = %s AND {PURE_FEATURES}
                       AND label_pm2_5 IS NOT NULL
                       AND target_at <= %s
                       AND origin_at > %s
                     """,
-                    (city, now_floor, cutoff),
+                    (city, horizon, now_floor, cutoff),
                 )
                 holdout = cur.fetchall()
                 mae_model = mae_persistence = None
@@ -378,7 +431,7 @@ def air_quality_ml():
                         holdout_rows, holdout_mae_model, holdout_mae_persistence,
                         trained_at
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (model_version, city) DO UPDATE SET
+                    ON CONFLICT (model_version, city, horizon_hours) DO UPDATE SET
                         feature_names = EXCLUDED.feature_names,
                         coefficients = EXCLUDED.coefficients,
                         intercept = EXCLUDED.intercept,
@@ -395,7 +448,7 @@ def air_quality_ml():
                     (
                         model_version,
                         city,
-                        HORIZON_HOURS,
+                        horizon,
                         Json(FEATURE_COLUMNS + ENCODED_TIME_FEATURES),
                         Json(model["coefficients"]),
                         model["intercept"],
@@ -410,12 +463,12 @@ def air_quality_ml():
                         mae_persistence,
                     ),
                 )
-                trained.append(city)
+                trained.append((city, horizon))
                 report = (
                     f"MAE holdout model={mae_model:.2f} persistence={mae_persistence:.2f}"
                     if holdout else "holdout kosong"
                 )
-                print(f"[ML] {city}: dilatih pada {len(rows)} baris ({report})")
+                print(f"[ML] {city} +{horizon}h: dilatih pada {len(rows)} baris ({report})")
 
         # DAG tidak boleh hijau kalau tidak ada satu pun model yang dilatih:
         # score_predictions akan memakai model lama/kosong tanpa peringatan.
@@ -433,8 +486,8 @@ def air_quality_ml():
     # TASK 3 - SCORING
     # -----------------------------------------------------------------------
     @task
-    def score_predictions(train_info: dict) -> dict:
-        """Prediksi setiap kota untuk jam target (origin + 6 jam).
+    def score_predictions(train_info: dict, **context) -> dict:
+        """Prediksi setiap kota untuk horizon 1–6 jam dari origin yang sama.
 
         Tiga nilai disimpan berdampingan pada saat yang sama:
         - predicted_pm2_5  : model ridge milik kita.
@@ -444,23 +497,23 @@ def air_quality_ml():
                              sebelum jam target tiba; bukan fitur model).
         """
         now_floor = hour_floor_wita()
-        run_id = f"ml-{now_floor:%Y%m%d%H%M}"
+        run_id = f"ml-{context['run_id']}"
         scored = 0
 
         with dw_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(DDL)
             cur.execute(
                 """
-                SELECT DISTINCT ON (city)
-                    city, model_version, intercept, coefficients,
+                SELECT DISTINCT ON (city, horizon_hours)
+                    city, horizon_hours, model_version, intercept, coefficients,
                     feature_means, feature_stds
                 FROM warehouse.ml_model
-                ORDER BY city, trained_at DESC, model_version DESC
+                ORDER BY city, horizon_hours, trained_at DESC, model_version DESC
                 """
             )
             models = {}
             for row in cur.fetchall():
-                models[row["city"]] = {
+                models[(row["city"], row["horizon_hours"])] = {
                     "model_version": row["model_version"],
                     "intercept": float(row["intercept"]),
                     "coefficients": [float(v) for v in row["coefficients"]],
@@ -473,17 +526,28 @@ def air_quality_ml():
 
             cur.execute(
                 f"""
-                SELECT DISTINCT ON (city)
-                    city, origin_at, target_at, target_hour, target_dow,
-                    {", ".join(FEATURE_COLUMNS)}
-                FROM warehouse.ml_features
-                WHERE origin_at <= %s AND {PURE_FEATURES}
-                ORDER BY city, origin_at DESC
+                WITH candidates AS (
+                    SELECT city, horizon_hours, origin_at, target_at, target_hour, target_dow,
+                           {", ".join(FEATURE_COLUMNS)},
+                           MAX(origin_at) OVER (PARTITION BY city) AS latest_origin
+                    FROM warehouse.ml_features
+                    WHERE origin_at <= %s AND {PURE_FEATURES}
+                )
+                SELECT city, horizon_hours, origin_at, target_at, target_hour, target_dow,
+                       {", ".join(FEATURE_COLUMNS)}
+                FROM candidates c
+                WHERE origin_at = COALESCE(
+                    (SELECT MAX(p.origin_at) FROM warehouse.ml_prediction p
+                     WHERE p.run_id = %s AND p.city = c.city),
+                    latest_origin
+                )
+                  AND target_at > (clock_timestamp() AT TIME ZONE 'Asia/Makassar')
+                ORDER BY city, horizon_hours
                 """,
-                (now_floor,),
+                (now_floor, run_id),
             )
             for row in cur.fetchall():
-                model = models.get(row["city"])
+                model = models.get((row["city"], row["horizon_hours"]))
                 if model is None:
                     continue
 
@@ -514,34 +578,72 @@ def air_quality_ml():
                 cur.execute(
                     """
                     INSERT INTO warehouse.ml_prediction (
-                        run_id, model_version, city, origin_at, target_at,
+                        run_id, model_version, city, horizon_hours, origin_at, target_at,
                         predicted_pm2_5, persistence_pm2_5, cams_pm2_5, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (run_id, city, target_at) DO UPDATE SET
-                        model_version = EXCLUDED.model_version,
-                        predicted_pm2_5 = EXCLUDED.predicted_pm2_5,
-                        persistence_pm2_5 = EXCLUDED.persistence_pm2_5,
-                        cams_pm2_5 = EXCLUDED.cams_pm2_5
+                    )
+                    SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                    WHERE %s > (clock_timestamp() AT TIME ZONE 'Asia/Makassar')
+                    ON CONFLICT (run_id, city, target_at) DO NOTHING
                     """,
                     (
                         run_id,
                         model["model_version"],
                         row["city"],
+                        row["horizon_hours"],
                         row["origin_at"],
                         row["target_at"],
                         predicted,
                         persistence,
                         cams,
+                        row["target_at"],
                     ),
                 )
+                if cur.rowcount == 0:
+                    print(f"[ML] {row['city']}: target {row['target_at']} lewat atau sudah tersimpan")
+                    continue
                 scored += 1
                 print(
-                    f"[ML] {row['city']}: prediksi {predicted:.1f} vs "
+                    f"[ML] {row['city']} +{row['horizon_hours']}h: prediksi {predicted:.1f} vs "
                     f"persistence {persistence:.1f} vs CAMS {cams if cams is None else round(cams, 1)} "
                     f"untuk {row['target_at']:%Y-%m-%d %H:%M}"
                 )
 
+            if not scored:
+                print("[ML] Tidak ada fitur lengkap dengan target masa depan; scoring kosong")
+
         return {"run_id": run_id, "scored": scored}
+
+    @task(retries=2, execution_timeout=timedelta(minutes=15))
+    def simulate_backtest(score_info: dict) -> dict:
+        """Bangun ulang simulasi historis tanpa mengubah prediksi operasional."""
+        with dw_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(DDL)
+            cur.execute(BACKTEST_ANCHORS_SQL)
+            anchors = {row["city"]: row["origin_at"] for row in cur.fetchall()}
+            cur.execute(
+                """
+                SELECT city, origin_at, target_at, target_hour, target_dow,
+                       lag_0, lag_1, lag_2, lag_3, lag_6, roll_mean_6,
+                       roll_mean_24, pm10_0, label_pm2_5
+                FROM warehouse.ml_features
+                WHERE city = ANY(%s) AND horizon_hours = 6
+                """,
+                (list(anchors),),
+            )
+            predictions = backtest_predictions(
+                cur.fetchall(), anchors, 6, HOLDOUT_HOURS,
+                MIN_TRAIN_ROWS, RIDGE_LAMBDA, RECENCY_HALF_LIFE_HOURS,
+            )
+            cur.execute("TRUNCATE warehouse.ml_backtest")
+            cur.executemany(
+                """
+                INSERT INTO warehouse.ml_backtest (city, target_at, origin_at, predicted_pm2_5)
+                VALUES (%s, %s, %s, %s)
+                """,
+                predictions,
+            )
+        print(f"[ML] Simulasi historis dibangun ulang: {len(predictions)} baris")
+        return {"simulated": len(predictions)}
 
     # -----------------------------------------------------------------------
     # TASK 4 - EVALUASI
@@ -578,9 +680,7 @@ def air_quality_ml():
             )
             updated = cur.rowcount
 
-            # 2. Hitung ulang MAE tiap run dari seluruh prediksi yang sudah
-            #    matang. Filter lengkap memastikan semua lengan dinilai pada
-            #    himpunan baris yang sama (perbandingan adil).
+            # Filter lengkap menjaga ketiga MAE pada himpunan baris yang sama.
             cur.execute(
                 """
                 INSERT INTO warehouse.ml_metrics (
@@ -589,54 +689,56 @@ def air_quality_ml():
                     mae_model, mae_persistence, mae_cams, updated_at
                 )
                 SELECT
-                    p.run_id,
-                    MIN(p.model_version),
-                    %s,
-                    (SELECT COUNT(*) FROM warehouse.ml_prediction q WHERE q.run_id = p.run_id),
-                    COUNT(*),
-                    AVG(ABS(p.predicted_pm2_5 - p.actual_pm2_5)),
-                    AVG(ABS(p.persistence_pm2_5 - p.actual_pm2_5)),
-                    AVG(ABS(p.cams_pm2_5 - p.actual_pm2_5)),
+                    p.run_id, MIN(p.model_version), p.horizon_hours,
+                    COUNT(*), COUNT(*) FILTER (WHERE p.comparable),
+                    AVG(ABS(p.predicted_pm2_5 - p.actual_pm2_5))
+                        FILTER (WHERE p.comparable),
+                    AVG(ABS(p.persistence_pm2_5 - p.actual_pm2_5))
+                        FILTER (WHERE p.comparable),
+                    AVG(ABS(p.cams_pm2_5 - p.actual_pm2_5))
+                        FILTER (WHERE p.comparable),
                     NOW()
-                FROM warehouse.ml_prediction p
-                WHERE p.actual_pm2_5 IS NOT NULL
-                  AND p.predicted_pm2_5 IS NOT NULL
-                  AND p.persistence_pm2_5 IS NOT NULL
-                  AND p.cams_pm2_5 IS NOT NULL
-                GROUP BY p.run_id
-                ON CONFLICT (run_id) DO UPDATE SET
+                FROM (
+                    SELECT *,
+                        actual_pm2_5 IS NOT NULL AND predicted_pm2_5 IS NOT NULL
+                        AND persistence_pm2_5 IS NOT NULL AND cams_pm2_5 IS NOT NULL
+                        AS comparable
+                    FROM warehouse.ml_prediction
+                ) p
+                GROUP BY p.run_id, p.horizon_hours
+                ON CONFLICT (run_id, horizon_hours) DO UPDATE SET
                     model_version = EXCLUDED.model_version,
-                    horizon_hours = EXCLUDED.horizon_hours,
                     n_predictions = EXCLUDED.n_predictions,
                     n_evaluated = EXCLUDED.n_evaluated,
                     mae_model = EXCLUDED.mae_model,
                     mae_persistence = EXCLUDED.mae_persistence,
                     mae_cams = EXCLUDED.mae_cams,
                     updated_at = NOW()
-                """,
-                (HORIZON_HOURS,),
+                """
             )
 
             run_id = score_info.get("run_id")
             cur.execute(
                 """
-                SELECT n_predictions, n_evaluated, mae_model, mae_persistence, mae_cams
-                FROM warehouse.ml_metrics WHERE run_id = %s
+                SELECT horizon_hours, n_predictions, n_evaluated,
+                       mae_model, mae_persistence, mae_cams
+                FROM warehouse.ml_metrics WHERE run_id = %s ORDER BY horizon_hours
                 """,
                 (run_id,),
             )
-            own = cur.fetchone()
+            own = cur.fetchall()
 
         print(f"[ML] Aktual diperbarui untuk {updated} prediksi")
-        if own:
-            print(
-                f"[ML] Metrik kumulatif {run_id}: n={own['n_evaluated']}, "
-                f"MAE model={own['mae_model']:.2f}, "
-                f"persistence={own['mae_persistence']:.2f}, "
-                f"CAMS={own['mae_cams']:.2f}"
-            )
-        else:
-            print(f"[ML] {run_id}: belum ada prediksi matang (tunggu {EVAL_DELAY_HOURS} jam)")
+        for metric in own:
+            if metric["n_evaluated"]:
+                print(
+                    f"[ML] Metrik {run_id} +{metric['horizon_hours']}h: "
+                    f"n={metric['n_evaluated']}, MAE model={metric['mae_model']:.2f}, "
+                    f"persistence={metric['mae_persistence']:.2f}, "
+                    f"CAMS={metric['mae_cams']:.2f}"
+                )
+            else:
+                print(f"[ML] {run_id} +{metric['horizon_hours']}h: belum ada prediksi matang")
         return {"run_id": run_id, "updated": updated}
 
     # -----------------------------------------------------------------------
@@ -646,6 +748,7 @@ def air_quality_ml():
     train_info = train_model(features_info)
     score_info = score_predictions(train_info)
     evaluate_predictions(score_info)
+    simulate_backtest(score_info)
 
 
 air_quality_ml()
