@@ -39,13 +39,12 @@ class DashboardHistorySQLTest(unittest.TestCase):
         expression = next(node.args[0] for node in ast.walk(tree)
                           if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                           and node.func.id == "query" and node.args
-                          and isinstance(node.args[0], ast.Call)
-                          and isinstance(node.args[0].func, ast.Attribute)
-                          and node.args[0].func.attr == "replace"
-                          and "historical_model" in node.args[0].func.value.value)
-        sql_expression = compile(ast.Expression(expression), "<dashboard query>", "eval")
-        sql = eval(sql_expression, {"backtest_available": True})
-        for name in ("ml_prediction", "ml_backtest", "dim_location", "dim_time", "fact_air_quality"):
+                          and isinstance(node.args[0], ast.Constant)
+                          and isinstance(node.args[0].value, str)
+                          and "historical_model" in node.args[0].value)
+        sql = expression.value
+        self.assertNotIn("ml_backtest", sql)
+        for name in ("ml_prediction", "dim_location", "dim_time", "fact_air_quality"):
             sql = sql.replace(f"warehouse.{name}", name)
         now = datetime.now(ZoneInfo("Asia/Makassar")).replace(tzinfo=None, minute=0, second=0, microsecond=0)
         origin = now - timedelta(hours=1)
@@ -63,8 +62,6 @@ class DashboardHistorySQLTest(unittest.TestCase):
             cur.execute("CREATE TEMP TABLE dim_location (location_key int, city text)")
             cur.execute("CREATE TEMP TABLE dim_time (time_key int, valid_at timestamp)")
             cur.execute("CREATE TEMP TABLE fact_air_quality (location_key int, time_key int, pm2_5 float)")
-            cur.execute("CREATE TEMP TABLE ml_backtest (city text, target_at timestamp, "
-                        "predicted_pm2_5 float)")
             cur.execute("INSERT INTO dim_location VALUES (1, 'Palu')")
             cur.execute("INSERT INTO dim_time VALUES (1, %s)", (historical,))
             cur.execute("INSERT INTO fact_air_quality VALUES (1, 1, 40)")
@@ -80,28 +77,19 @@ class DashboardHistorySQLTest(unittest.TestCase):
                 (8, 'other-horizon', 'Palu', historical - timedelta(hours=1), historical, 77, 77, before),
             ]
             cur.executemany("INSERT INTO ml_prediction VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", rows)
-            cur.execute("INSERT INTO ml_backtest VALUES (%s, %s, %s), (%s, %s, %s)",
-                        ("Palu", historical, 30, "Kota lain", historical, 99))
             cur.execute(sql)
             result = [row for row in cur.fetchall() if row[0] == "Palu"]
             self.assertEqual(len(result), 12)
             selected = next(row for row in result if row[3] == historical)
-            self.assertEqual(selected[4:8], (40, 20, None, 30))
+            self.assertEqual(selected[4:7], (40, 20, None))
             missing = next(row for row in result if row[3] == historical - timedelta(hours=1))
-            self.assertEqual(missing[4:8], (None, None, None, None))
+            self.assertEqual(missing[4:7], (None, None, None))
             self.assertTrue(all(row[2] == 'new' for row in result))
-            future = {row[3]: row[8:] for row in result if row[3] > origin}
+            future = {row[3]: row[7:] for row in result if row[3] > origin}
             self.assertEqual(future[origin + timedelta(hours=1)], (50, 51))
             self.assertEqual(future[origin + timedelta(hours=2)], (None, None))
             self.assertEqual(future[origin + timedelta(hours=3)], (53, None))
             self.assertEqual(future[origin + timedelta(hours=6)], (None, None))
-            cur.execute("DROP TABLE ml_backtest")
-            fallback = eval(sql_expression, {"backtest_available": False})
-            for name in ("ml_prediction", "dim_location", "dim_time", "fact_air_quality"):
-                fallback = fallback.replace(f"warehouse.{name}", name)
-            cur.execute(fallback)
-            selected = next(row for row in cur.fetchall() if row[0] == "Palu" and row[3] == historical)
-            self.assertEqual(selected[4:8], (40, 20, None, None))
 
 
 if __name__ == "__main__":

@@ -74,10 +74,6 @@ class EvaluationSQLTest(unittest.TestCase):
             cur.execute("SELECT n_evaluated, mae_model FROM ml_metrics WHERE run_id = 'r'")
             self.assertEqual(cur.fetchall(), [(0, None), (0, None)])
 
-    def test_backtest_queries_only_six_hour_features(self):
-        query = task_sql("simulate_backtest", "FROM warehouse.ml_features")
-        self.assertIn("horizon_hours = 6", query)
-
 
 if __name__ == "__main__":
     unittest.main()

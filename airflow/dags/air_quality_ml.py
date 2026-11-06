@@ -1,17 +1,16 @@
 # AIR QUALITY ML
-# DAG Airflow (E4): model prediksi PM2.5 enam jam ke depan per kota.
+# DAG Airflow (E4): model prediksi PM2.5 satu sampai enam jam ke depan per kota.
 #
-# ALUR (lima task)
+# ALUR (empat task)
 # =================
 # 1. build_features        : rakit tabel fitur dari fact_air_quality + dim_time.
 # 2. train_model           : latih ridge regression per kota dengan split
 #                            berbasis waktu, simpan parameter ke ml_model.
-# 3. score_predictions     : prediksi jam target (origin + 6 jam) per kota,
+# 3. score_predictions     : prediksi jam target (origin +1 hingga +6 jam) per kota,
 #                            simpan ke ml_prediction bersama versi model dan
 #                            waktu pembuatannya.
 # 4. evaluate_predictions  : isi nilai aktual setelah jam target lewat, lalu
 #                            hitung MAE tiga pendekatan ke ml_metrics.
-# 5. simulate_backtest     : simulasi historis terpisah dari prediksi operasional.
 #
 # KEPUTUSAN PENTING
 # =================
@@ -40,10 +39,7 @@ from airflow.sdk import dag, task
 from airflow.sdk.exceptions import AirflowSkipException
 from psycopg2.extras import Json, RealDictCursor
 
-from ml_lib import (
-    BACKTEST_ANCHORS_SQL, FEATURE_COLUMNS, backtest_predictions, fit_ridge, model_input,
-    predict_ridge,
-)
+from ml_lib import FEATURE_COLUMNS, fit_ridge, model_input, predict_ridge
 
 # ---------------------------------------------------------------------------
 # KONFIGURASI
@@ -134,15 +130,6 @@ CREATE TABLE IF NOT EXISTS warehouse.ml_metrics (
     mae_cams DOUBLE PRECISION,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (run_id, horizon_hours)
-);
-
-CREATE TABLE IF NOT EXISTS warehouse.ml_backtest (
-    city TEXT NOT NULL,
-    target_at TIMESTAMP NOT NULL,
-    origin_at TIMESTAMP NOT NULL,
-    predicted_pm2_5 DOUBLE PRECISION NOT NULL,
-    simulated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (city, target_at)
 );
 
 DO $$
@@ -613,38 +600,6 @@ def air_quality_ml():
 
         return {"run_id": run_id, "scored": scored}
 
-    @task(retries=2, execution_timeout=timedelta(minutes=15))
-    def simulate_backtest(score_info: dict) -> dict:
-        """Bangun ulang simulasi historis tanpa mengubah prediksi operasional."""
-        with dw_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(DDL)
-            cur.execute(BACKTEST_ANCHORS_SQL)
-            anchors = {row["city"]: row["origin_at"] for row in cur.fetchall()}
-            cur.execute(
-                """
-                SELECT city, origin_at, target_at, target_hour, target_dow,
-                       lag_0, lag_1, lag_2, lag_3, lag_6, roll_mean_6,
-                       roll_mean_24, pm10_0, label_pm2_5
-                FROM warehouse.ml_features
-                WHERE city = ANY(%s) AND horizon_hours = 6
-                """,
-                (list(anchors),),
-            )
-            predictions = backtest_predictions(
-                cur.fetchall(), anchors, 6, HOLDOUT_HOURS,
-                MIN_TRAIN_ROWS, RIDGE_LAMBDA, RECENCY_HALF_LIFE_HOURS,
-            )
-            cur.execute("TRUNCATE warehouse.ml_backtest")
-            cur.executemany(
-                """
-                INSERT INTO warehouse.ml_backtest (city, target_at, origin_at, predicted_pm2_5)
-                VALUES (%s, %s, %s, %s)
-                """,
-                predictions,
-            )
-        print(f"[ML] Simulasi historis dibangun ulang: {len(predictions)} baris")
-        return {"simulated": len(predictions)}
-
     # -----------------------------------------------------------------------
     # TASK 4 - EVALUASI
     # -----------------------------------------------------------------------
@@ -748,7 +703,6 @@ def air_quality_ml():
     train_info = train_model(features_info)
     score_info = score_predictions(train_info)
     evaluate_predictions(score_info)
-    simulate_backtest(score_info)
 
 
 air_quality_ml()

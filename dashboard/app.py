@@ -166,6 +166,10 @@ def render_batch() -> None:
 
     try:
         data = read_fact()
+        last_load = query("""
+            SELECT MAX(loaded_at) AT TIME ZONE 'Asia/Makassar' AS last_at
+            FROM warehouse.fact_air_quality
+        """).iloc[0]["last_at"]
     except (psycopg2.Error, OSError) as exc:
         st.error("Database belum siap. Periksa status PostgreSQL dan jalankan pipeline Airflow.")
         st.code(str(exc))
@@ -189,7 +193,11 @@ def render_batch() -> None:
     k1.metric("Kota terpilih", len(selected))
     k2.metric("Baris fakta", f"{len(view):,}")
     k3.metric("PM2.5 rerata (µg/m³)", f"{view['pm2_5'].mean():.1f}" if view["pm2_5"].notna().any() else "—")
-    k4.metric("Jam data terakhir (WITA)", view["valid_at"].max().strftime("%d/%m/%Y %H:%M"))
+    k4.metric(
+        "Warehouse terakhir dimuat (WITA)",
+        pd.to_datetime(last_load).strftime("%d/%m/%Y %H:%M") if pd.notna(last_load)
+        else "Belum ada",
+    )
 
     st.subheader("PM2.5 per jam dalam tujuh hari terakhir")
     trend = recent.pivot_table(index="valid_at", columns="city", values="pm2_5", aggfunc="mean")
@@ -202,9 +210,7 @@ def render_batch() -> None:
     means = recent.groupby("city", as_index=True)[["pm2_5", "pm10"]].mean()
     st.bar_chart(means, x_label="Kota", y_label="Konsentrasi (µg/m³)")
 
-    st.subheader("50 catatan terbaru")
-    st.dataframe(view.head(50), width="stretch", hide_index=True)
-    st.caption("Ini data model kualitas udara dari Open-Meteo/CAMS, bukan pembacaan sensor lapangan. Nilai kosong tetap kosong; jangan ditafsirkan sebagai nol. Indeks AQI Eropa hanya ditampilkan jika tersedia.")
+    st.caption("Ini data model kualitas udara dari Open-Meteo/CAMS, bukan pembacaan sensor lapangan. Nilai kosong tetap kosong; jangan ditafsirkan sebagai nol.")
 
 
 # ---------------------------------------------------------------- analitik per kota
@@ -438,6 +444,265 @@ def render_analytics() -> None:
             with col:
                 render_city_card(summaries[city], now_floor)
 
+    render_detailed_analytics(data, cities, now_floor)
+
+
+def analytics_periods(now_floor: pd.Timestamp, days: int) -> tuple:
+    """Batas dua periode jam yang berdampingan, akhir tidak termasuk."""
+    end = now_floor + pd.Timedelta(hours=1)
+    current_start = end - pd.Timedelta(days=days)
+    return current_start - pd.Timedelta(days=days), current_start, end
+
+
+def analytics_summary(
+    data: pd.DataFrame, cities: list[str], pollutant: str,
+    now_floor: pd.Timestamp, days: int,
+) -> pd.DataFrame:
+    """Rata-rata dan cakupan nilai valid per kota dan periode."""
+    previous_start, current_start, end = analytics_periods(now_floor, days)
+    rows = []
+    for city in cities:
+        for period, start, stop in (
+            ("Kini", current_start, end),
+            ("Sebelumnya", previous_start, current_start),
+        ):
+            values = data.loc[
+                (data["city"] == city) & (data["valid_at"] >= start)
+                & (data["valid_at"] < stop), pollutant
+            ].dropna()
+            expected = days * 24
+            rows.append({
+                "city": city, "period": period, "valid": len(values),
+                "expected": expected, "mean": values.mean() if len(values) else None,
+                "coverage": len(values) / expected,
+            })
+    return pd.DataFrame(rows, columns=["city", "period", "valid", "expected", "mean", "coverage"])
+
+
+def analytics_patterns(data: pd.DataFrame, pollutant: str) -> tuple:
+    """Rerata dan jumlah nilai valid menurut jam serta tanggal WITA."""
+    valid = data.dropna(subset=[pollutant]).copy()
+    valid["Jam"] = valid["valid_at"].dt.hour
+    valid["Tanggal"] = valid["valid_at"].dt.normalize()
+    hourly = valid.groupby(["city", "Jam"], as_index=False).agg(
+        mean=(pollutant, "mean"), valid=(pollutant, "count")
+    )
+    daily = valid.groupby(["city", "Tanggal"], as_index=False).agg(
+        mean=(pollutant, "mean"), valid=(pollutant, "count")
+    )
+    return hourly, daily
+
+
+def aggregate_heatmap(data: pd.DataFrame, city: str, pollutant: str) -> pd.DataFrame:
+    """Rerata dan jumlah jam valid per hari dan jam untuk satu kota."""
+    valid = data.loc[
+        (data["city"] == city) & data["valid_at"].notna() & data[pollutant].notna(),
+        ["valid_at", pollutant],
+    ].copy()
+    valid["day"] = valid["valid_at"].dt.dayofweek
+    valid["hour"] = valid["valid_at"].dt.hour
+    grouped = valid.groupby(["day", "hour"])[pollutant].agg(
+        mean="mean", valid_hours="count"
+    )
+    grid = pd.MultiIndex.from_product([range(7), range(24)], names=["day", "hour"])
+    result = grouped.reindex(grid).reset_index()
+    result["valid_hours"] = result["valid_hours"].fillna(0).astype(int)
+    return result
+
+
+def analytics_distribution(
+    data: pd.DataFrame, cities: list[str], pollutant: str,
+) -> pd.DataFrame:
+    """Ringkasan sebaran nilai valid per kota pada data periode terpilih."""
+    rows = []
+    for city in cities:
+        values = data.loc[data["city"] == city, pollutant].dropna()
+        if values.empty:
+            continue
+        q1 = values.quantile(0.25)
+        q3 = values.quantile(0.75)
+        iqr = q3 - q1
+        inside = values[(values >= q1 - 1.5 * iqr) & (values <= q3 + 1.5 * iqr)]
+        rows.append({
+            "city": city, "minimum": inside.min(), "q1": q1,
+            "median": values.median(), "q3": q3,
+            "maximum": inside.max(), "valid_hours": len(values),
+        })
+    return pd.DataFrame(
+        rows, columns=["city", "minimum", "q1", "median", "q3", "maximum", "valid_hours"]
+    )
+
+
+def analytics_distribution_outliers(
+    data: pd.DataFrame, distribution: pd.DataFrame, pollutant: str,
+) -> pd.DataFrame:
+    """Observasi di luar pagar 1,5 IQR beserta waktu dan kotanya."""
+    values = data.loc[
+        data[pollutant].notna() & data["valid_at"].notna(),
+        ["city", "valid_at", pollutant],
+    ].merge(distribution[["city", "q1", "q3"]], on="city", how="inner")
+    iqr = values["q3"] - values["q1"]
+    outliers = (values[pollutant] < values["q1"] - 1.5 * iqr) | (
+        values[pollutant] > values["q3"] + 1.5 * iqr
+    )
+    return values.loc[outliers, ["city", "valid_at", pollutant]].copy()
+
+
+def analytics_exceedance(
+    data: pd.DataFrame, cities: list[str], pollutant: str,
+    start: pd.Timestamp, end: pd.Timestamp, threshold: float,
+) -> pd.DataFrame:
+    """Jumlah dan persentase nilai valid yang melampaui ambang per kota."""
+    rows = []
+    for city in cities:
+        values = data.loc[
+            (data["city"] == city) & (data["valid_at"] >= start)
+            & (data["valid_at"] < end), pollutant
+        ].dropna()
+        count = len(values)
+        above = int((values > threshold).sum())
+        rows.append({"city": city, "above": above, "valid": count,
+                     "percent": 100 * above / count if count else None})
+    return pd.DataFrame(rows, columns=["city", "above", "valid", "percent"])
+
+
+def render_detailed_analytics(data: pd.DataFrame, cities: list[str], now_floor: pd.Timestamp) -> None:
+    st.divider()
+    st.subheader("Analisis perbandingan")
+    filters = st.columns(3)
+    selected = filters[0].multiselect("Kota", cities, default=cities, key="detail_cities")
+    days = filters[1].selectbox("Periode", [7, 14, 30], format_func=lambda n: f"{n} hari")
+    label = filters[2].selectbox("Polutan", ["PM2.5", "PM10"])
+    pollutant = {"PM2.5": "pm2_5", "PM10": "pm10"}[label]
+    threshold = st.number_input(f"Ambang {label} (µg/m³)", min_value=0.0, value=35.0)
+    if not selected:
+        st.info("Pilih setidaknya satu kota untuk melihat analisis.")
+        return
+
+    previous_start, current_start, end = analytics_periods(now_floor, days)
+    summary = analytics_summary(data, selected, pollutant, now_floor, days)
+    comparison = []
+    for city in selected:
+        city_rows = summary[summary["city"] == city].set_index("period")
+        current, previous = city_rows.loc["Kini"], city_rows.loc["Sebelumnya"]
+        change = current["mean"] - previous["mean"] if current["valid"] and previous["valid"] else None
+        comparison.append({
+            "Kota": city, "Rerata kini": current["mean"],
+            "Rerata sebelumnya": previous["mean"],
+            "Perubahan": change,
+        })
+    st.markdown(f"**Perbandingan {label} (µg/m³)**")
+    st.dataframe(pd.DataFrame(comparison), hide_index=True, width="stretch")
+    st.caption("Perubahan = kini − sebelumnya.")
+    if (summary["valid"] < summary["expected"]).any():
+        st.warning("Cakupan belum lengkap; perbandingan dapat dipengaruhi jam yang hilang.")
+
+    current = data.loc[
+        data["city"].isin(selected) & (data["valid_at"] >= current_start)
+        & (data["valid_at"] <= now_floor), ["city", "valid_at", pollutant]
+    ].dropna(subset=[pollutant]).copy()
+    if current.empty:
+        st.info("Tidak ada nilai valid pada periode kini; pilih kota atau periode lain.")
+        return
+    city_means = current.groupby("city")[pollutant].mean().sort_values(ascending=False)
+    if len(city_means) > 1:
+        st.write(f"Rerata tertinggi: **{city_means.index[0]}** ({city_means.iloc[0]:.1f} µg/m³).")
+
+    hourly, daily = analytics_patterns(current, pollutant)
+    st.markdown("**Pola rata-rata menurut jam dan tanggal**")
+    st.caption("Rata-rata nilai valid pada periode kini; jumlah jam tiap kelompok dapat berbeda.")
+    charts = st.columns(2)
+    for column, frame, x in (
+        (charts[0], hourly, "Jam:Q"),
+        (charts[1], daily, "Tanggal:T"),
+    ):
+        chart = alt.Chart(frame).mark_line(point=True).encode(
+            x=alt.X(x, title=x.split(":")[0]),
+            y=alt.Y("mean:Q", title=f"{label} (µg/m³)"),
+            color=alt.Color("city:N", title="Kota"),
+            tooltip=["city:N", x, alt.Tooltip("mean:Q", title="Rerata", format=".1f"),
+                     alt.Tooltip("valid:Q", title="Jam valid")],
+        )
+        column.altair_chart(chart, use_container_width=True)
+
+    st.markdown("**Pola hari dan jam**")
+    st.caption("Warna menunjukkan rerata; sel kosong berarti tidak ada jam valid.")
+    heatmap_city = st.selectbox("Kota untuk heatmap", selected, key="heatmap_city")
+    heatmap = aggregate_heatmap(current, heatmap_city, pollutant)
+    if heatmap["valid_hours"].sum() == 0:
+        st.info("Tidak ada nilai valid untuk kota ini; pilih kota atau periode lain.")
+    else:
+        days_of_week = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+        heatmap["Hari"] = heatmap["day"].map(dict(enumerate(days_of_week)))
+        chart = alt.Chart(heatmap).mark_rect().encode(
+            x=alt.X("hour:O", title="Jam WITA", scale=alt.Scale(domain=list(range(24)))),
+            y=alt.Y("Hari:N", title="Hari", scale=alt.Scale(domain=days_of_week)),
+            color=alt.Color("mean:Q", title=f"{label} (µg/m³)", scale=alt.Scale(scheme="blues")),
+            tooltip=[
+                alt.Tooltip("Hari:N", title="Hari"),
+                alt.Tooltip("hour:O", title="Jam WITA"),
+                alt.Tooltip("mean:Q", title="Rerata (µg/m³)", format=".1f"),
+                alt.Tooltip("valid_hours:Q", title="Jam valid"),
+            ],
+        ).transform_filter("isValid(datum.mean)")
+        st.altair_chart(chart, use_container_width=True)
+
+    st.markdown(f"**Sebaran {label} per kota**")
+    distribution = analytics_distribution(current, selected, pollutant)
+    missing = [city for city in selected if city not in distribution["city"].values]
+    if missing:
+        st.info(f"Tidak ada nilai valid untuk: {', '.join(missing)}.")
+    tooltip = [
+        alt.Tooltip("city:N", title="Kota"),
+        alt.Tooltip("minimum:Q", title=f"Whisker bawah {label} (µg/m³)", format=".1f"),
+        alt.Tooltip("q1:Q", title=f"Kuartil 1 {label} (µg/m³)", format=".1f"),
+        alt.Tooltip("median:Q", title=f"Median {label} (µg/m³)", format=".1f"),
+        alt.Tooltip("q3:Q", title=f"Kuartil 3 {label} (µg/m³)", format=".1f"),
+        alt.Tooltip("maximum:Q", title=f"Whisker atas {label} (µg/m³)", format=".1f"),
+        alt.Tooltip("valid_hours:Q", title="Jam valid"),
+    ]
+    base = alt.Chart(distribution).encode(
+        x=alt.X("city:N", title="Kota", sort=selected),
+        tooltip=tooltip,
+    )
+    axis = alt.Y("minimum:Q", title=f"{label} (µg/m³)")
+    whisker = base.mark_rule().encode(y=axis, y2="maximum:Q")
+    box = base.mark_bar(size=30).encode(
+        y=alt.Y("q1:Q", title=f"{label} (µg/m³)"), y2="q3:Q"
+    )
+    median = base.mark_tick(color="white", thickness=2, size=30).encode(
+        y=alt.Y("median:Q", title=f"{label} (µg/m³)")
+    )
+    outliers = analytics_distribution_outliers(current, distribution, pollutant)
+    outliers["waktu_wita"] = outliers["valid_at"].dt.strftime("%d/%m/%Y %H:%M")
+    outliers["waktu_wita"] = outliers.groupby(["city", pollutant])["waktu_wita"].transform(
+        lambda times: ", ".join(times)
+    )
+    points = alt.Chart(outliers).mark_point(filled=True, size=55).encode(
+        x=alt.X("city:N", title="Kota", sort=selected),
+        y=alt.Y(f"{pollutant}:Q", title=f"{label} (µg/m³)"),
+        tooltip=[
+            alt.Tooltip("city:N", title="Kota"),
+            alt.Tooltip("waktu_wita:N", title="Tanggal dan jam WITA"),
+            alt.Tooltip(f"{pollutant}:Q", title=f"{label} (µg/m³)", format=".2f"),
+        ],
+    )
+    st.altair_chart(
+        whisker + box + median + points,
+        use_container_width=True,
+        key=f"distribution_{pollutant}",
+    )
+
+    st.markdown(f"**Jam di atas {threshold:g} µg/m³**")
+    exceedance = analytics_exceedance(data, selected, pollutant, current_start, end, threshold)
+    st.caption("Persentase = jam di atas ambang / jam dengan nilai valid pada periode kini.")
+    st.dataframe(
+        exceedance[["city", "above", "percent"]].rename(
+            columns={"city": "Kota", "above": "Jam di atas ambang", "percent": "Persen (%)"}
+        ),
+        hide_index=True, width="stretch",
+    )
+
 
 # ---------------------------------------------------------------- jalur ML (E4)
 
@@ -475,13 +740,10 @@ def render_ml() -> None:
             WHERE horizon_hours = {metric_horizon}
             ORDER BY city, trained_at DESC
         """)
-        backtest_available = query(
-            "SELECT to_regclass('warehouse.ml_backtest') IS NOT NULL AS available"
-        ).iloc[0]["available"]
         preds = query("""
             SELECT p.city, p.origin_at, p.run_id, hours.valid_at,
                    f.pm2_5, h.predicted_pm2_5 AS historical_model,
-                   h.cams_pm2_5 AS historical_cams, b.predicted_pm2_5 AS simulated_model,
+                   h.cams_pm2_5 AS historical_cams,
                    future.predicted_pm2_5, future.cams_pm2_5
             FROM (
                 SELECT DISTINCT ON (city) city, origin_at, run_id
@@ -502,8 +764,6 @@ def render_ml() -> None:
                 ON future.city = p.city AND future.run_id = p.run_id
                 AND future.origin_at = p.origin_at AND future.target_at = hours.valid_at
                 AND future.target_at > p.origin_at
-            LEFT JOIN __BACKTEST_SOURCE__ b
-                ON b.city = p.city AND b.target_at = hours.valid_at
             LEFT JOIN LATERAL (
                 SELECT predicted_pm2_5, cams_pm2_5
                 FROM warehouse.ml_prediction h
@@ -514,12 +774,7 @@ def render_ml() -> None:
                 LIMIT 1
             ) h ON TRUE
             ORDER BY p.city, hours.valid_at
-        """.replace(
-            "__BACKTEST_SOURCE__",
-            "warehouse.ml_backtest" if backtest_available else
-            "(SELECT NULL::text AS city, NULL::timestamp AS target_at, "
-            "NULL::double precision AS predicted_pm2_5 WHERE FALSE)",
-        ))
+        """)
         cities = read_cities()
         history = query(f"""
             SELECT run_id, horizon_hours, model_version, n_evaluated,
@@ -534,14 +789,6 @@ def render_ml() -> None:
                    predicted_pm2_5, persistence_pm2_5, cams_pm2_5, actual_pm2_5
             FROM warehouse.ml_prediction
             ORDER BY created_at DESC, target_at
-            LIMIT 20
-        """)
-        observations = query("""
-            SELECT t.valid_at, l.city, f.pm2_5, f.pm10, f.european_aqi
-            FROM warehouse.fact_air_quality f
-            JOIN warehouse.dim_location l USING (location_key)
-            JOIN warehouse.dim_time t USING (time_key)
-            ORDER BY t.valid_at DESC, l.city
             LIMIT 20
         """)
         volume = query("""
@@ -586,8 +833,6 @@ def render_ml() -> None:
         st.caption(f"Belum ada prediksi horizon +{metric_horizon} jam yang matang untuk dinilai (target ditambah jeda 3 jam). Angka di atas = MAE holdout 48 jam terakhir, rata-rata kota.")
 
     st.subheader("PM2.5 enam jam historis dan prediksi enam jam ke depan")
-    if not backtest_available:
-        st.info("Simulasi historis belum tersedia. Jalankan DAG air_quality_ml lalu muat ulang.")
     if not cities:
         st.info("Belum ada kota di warehouse. Jalankan DAG batch, lalu muat ulang data.")
     else:
@@ -602,18 +847,18 @@ def render_ml() -> None:
             prediction = view.iloc[0]
             origin = pd.Timestamp(prediction["origin_at"])
             values = view.set_index("valid_at")[
-                ["pm2_5", "historical_model", "historical_cams", "simulated_model",
+                ["pm2_5", "historical_model", "historical_cams",
                  "predicted_pm2_5", "cams_pm2_5"]
             ]
             values.index = pd.to_datetime(values.index)
             values = values.reindex(pd.date_range(start=origin - pd.Timedelta(hours=5),
                                                   periods=12, freq="h"))
             values.loc[values.index > origin,
-                       ["pm2_5", "historical_model", "historical_cams", "simulated_model"]] = None
+                       ["pm2_5", "historical_model", "historical_cams"]] = None
             values.loc[values.index <= origin, ["predicted_pm2_5", "cams_pm2_5"]] = None
             values.columns = [
                 "Data aktual", "Model historis operasional +6", "CAMS historis +6",
-                "Simulasi historis +6", "Prediksi model", "CAMS",
+                "Prediksi model", "CAMS",
             ]
             for label in values.columns:
                 column = values[label]
@@ -639,10 +884,8 @@ def render_ml() -> None:
                 f"Run `{prediction['run_id']}`; asal: {origin:%d/%m/%Y %H:%M} WITA; "
                 "target +1 sampai +6 jam. Fakta historis adalah Open-Meteo/CAMS, bukan sensor lapangan. "
                 "Model historis operasional dan CAMS historis adalah snapshot horizon +6 terbaru "
-                "sebelum tiap target; titik dapat berasal dari run berbeda. Simulasi historis +6 "
-                "dilatih ulang per target menggunakan histori warehouse saat ini, "
-                "yang mungkin telah direvisi; ini bukan snapshot data pada waktu simulasi "
-                "dan tidak masuk metrik operasional. Garis prediksi dimulai dari data aktual "
+                "sebelum tiap target; titik dapat berasal dari run berbeda. "
+                "Garis prediksi dimulai dari data aktual "
                 "pada waktu asal; celah berarti nilai tidak tersedia."
             )
 
@@ -660,13 +903,6 @@ def render_ml() -> None:
         history[["mae_model", "mae_persistence", "mae_cams"]] = history[["mae_model", "mae_persistence", "mae_cams"]].round(2)
         st.dataframe(history, width="stretch", hide_index=True)
 
-    st.subheader("20 observasi terbaru yang sudah masuk database")
-    if observations.empty:
-        st.info("Belum ada observasi di fact table. Jalankan DAG batch lebih dulu.")
-    else:
-        observations["valid_at"] = pd.to_datetime(observations["valid_at"])
-        st.dataframe(observations, width="stretch", hide_index=True)
-        st.caption("Fact table juga memuat forecast masa depan. Nilai kosong tetap kosong, jangan ditafsirkan sebagai nol.")
 
 
 # ---------------------------------------------------------------- pengaturan jalur
@@ -695,11 +931,10 @@ PIPELINES = {
         "detail": "DAG air_quality_end_to_end, jadwal tiap 3 jam.",
         "efek": "Dimatikan: run DAG berikutnya dilewati seluruhnya — tidak ada extract, tidak ada Spark, tidak ada data baru.",
         "status_sql": """
-            SELECT MAX(t.valid_at) AS last_at
-            FROM warehouse.fact_air_quality f
-            JOIN warehouse.dim_time t USING (time_key)
+            SELECT MAX(loaded_at) AT TIME ZONE 'Asia/Makassar' AS last_at
+            FROM warehouse.fact_air_quality
         """,
-        "status_label": "Data batch terakhir",
+        "status_label": "Warehouse terakhir dimuat (WITA)",
     },
     "streaming": {
         "label": "Jalur streaming",
@@ -740,13 +975,13 @@ def set_enabled(pipeline: str, enabled: bool) -> None:
 
 
 def last_status(meta: dict) -> str:
-    """Jam data terakhir dari sebuah jalur, atau '-' kalau tabelnya belum ada."""
+    """Waktu terakhir jalur, atau keterangan jika kosong atau gagal dibaca."""
     try:
         value = query(meta["status_sql"]).iloc[0]["last_at"]
     except (psycopg2.Error, OSError, IndexError, KeyError):
-        return "—"
+        return "Gagal membaca status; periksa PostgreSQL"
     if pd.isna(value):
-        return "—"
+        return "Belum ada data"
     return pd.to_datetime(value).strftime("%d/%m/%Y %H:%M")
 
 
