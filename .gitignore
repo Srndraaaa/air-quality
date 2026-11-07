@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Env lokal
+.env
+
+# Semua dokumentasi markdown (lokal saja)
+*.md
+
+# Backup volume Docker lokal
+backup-volumes-*/
+
+# Log lokal
+*.log
